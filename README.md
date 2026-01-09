@@ -32,21 +32,27 @@ cd SmartSpark-S3-Tool
 
 # Create a virtual environment (Isolated Workspace)
 python -m venv venv
+```
 
 # Activate the environment
+```bash
 # On Mac/Linux:
 source venv/bin/activate
 # On Windows:
 .\venv\Scripts\activate
+```
 
 # Install the app using setup.py
+```bash
 # The '-e' flag allows you to edit the code and see changes instantly
 pip install -e .
+```
 
 ### 3. Launch the App
 Open your terminal, ensure your virtual environment is activated, and run:
 ```bash
 streamlit run app.py
+```
 
 This will start the SmartSpark web application. A new browser window should automatically open displaying the interface. If it doesn't, navigate to the URL shown in your terminal (typically http://localhost:8501).
 
@@ -76,6 +82,7 @@ Create these files in your root directory to customize the application.
   "sidebar_header": "Data Controls",
   "theme_color": "#FF4B4B"
 }
+```
 
 ### 🧠 AI Logic (prompts.json)
 ```json
@@ -84,6 +91,7 @@ Create these files in your root directory to customize the application.
   "one_shot_example": "User: Top 5 sales. Assistant: SELECT * FROM df ORDER BY sales DESC LIMIT 5;",
   "analysis_instruction": "Identify trends and anomalies in the provided data sample."
 }
+```
 
 ### 🔑 Credentials (aws_credentials.json)
 ```json
@@ -92,6 +100,7 @@ Create these files in your root directory to customize the application.
   "aws_secret_key": "YOUR_SECRET_KEY",
   "region": "us-east-1"
 }
+```
 
 ## 🔒 Security & Privacy
 
