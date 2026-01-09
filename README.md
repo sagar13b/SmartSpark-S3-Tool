@@ -30,8 +30,8 @@ We use a **Virtual Environment (venv)** to keep your global Python installation 
 git clone https://github.com/sagar13b/SmartSpark-S3-Tool.git
 cd SmartSpark-S3-Tool
 
-# Create a virtual environment (Isolated Workspace)
-python -m venv venv
+# Run setup
+bash setup.sh
 ```
 
 # Activate the environment
@@ -70,11 +70,28 @@ Unlike a simple `requirements.txt` file, `setup.py` treats SmartSpark as a profe
 
 ---
 
-## ⚙️ Configuration Templates
+## ⚙️ Configuration
 
-Create these files in your root directory to customize the application.
+### Credentials
 
-### 🎨 App UI (config.json)
+For the application to access AWS S3 and use the AI features, you need to provide credentials. The recommended way is to use a `.env` file in the root of the project.
+
+Create a file named `.env` and add the following content:
+
+```
+OPENAI_API_KEY="sk-..."
+AWS_ACCESS_KEY_ID="YOUR_ACCESS_KEY"
+AWS_SECRET_ACCESS_KEY="YOUR_SECRET_KEY"
+AWS_SESSION_TOKEN="YOUR_SESSION_TOKEN"  # Optional
+```
+
+Alternatively, you can set these as environment variables in your shell. The application will also allow you to enter these credentials in the UI, which will then be saved to the `.env` file.
+
+### UI and Prompts
+
+You can customize the UI and AI behavior by creating `config.json` and `prompts.json` in the root directory.
+
+#### 🎨 App UI (config.json)
 ```json
 {
   "app_title": "SmartSpark Explorer",
@@ -84,7 +101,7 @@ Create these files in your root directory to customize the application.
 }
 ```
 
-### 🧠 AI Logic (prompts.json)
+#### 🧠 AI Logic (prompts.json)
 ```json
 {
   "system_message": "You are a Senior Data Analyst. Help users write Spark SQL and find insights.",
@@ -92,23 +109,6 @@ Create these files in your root directory to customize the application.
   "analysis_instruction": "Identify trends and anomalies in the provided data sample."
 }
 ```
-
-### 🔑 Credentials (aws_credentials.json)
-```json
-{
-  "aws_access_key": "YOUR_ACCESS_KEY",
-  "aws_secret_key": "YOUR_SECRET_KEY",
-  "region": "us-east-1"
-}
-```
-
-## 🔒 Security & Privacy
-
-Your data security is a priority. The app is configured with a `.gitignore` to ensure your sensitive keys never leave your machine:
-
-* `aws_credentials.json`: Stores S3 Access keys.
-* `openai_key.json`: Stores your OpenAI API key.
-* `spark_tables_metadata.json`: Local cache tracking.
 
 ## 🛠️ Troubleshooting
 

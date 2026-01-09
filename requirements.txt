@@ -1,7 +1,7 @@
+pyspark==3.5.0
 streamlit
-pandas
-pyspark
-boto3
-botocore
-psutil
 openai
+pandas
+boto3
+python-dotenv
+psutil

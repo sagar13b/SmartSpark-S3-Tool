@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
 import pandas as pd
 from pyspark.sql import SparkSession
@@ -15,11 +18,35 @@ import re
 from openai import OpenAI
 
 
+def update_env_file(key, value):
+    """
+    Updates a key-value pair in the .env file.
+    Creates the .env file if it doesn't exist.
+    """
+    env_file = '.env'
+    lines = []
+    key_found = False
+
+    if os.path.exists(env_file):
+        with open(env_file, 'r') as f:
+            lines = f.readlines()
+
+    with open(env_file, 'w') as f:
+        for line in lines:
+            if line.strip().startswith(f'{key}='):
+                f.write(f'{key}="{value}"\n')
+                key_found = True
+            else:
+                f.write(line)
+        if not key_found:
+            f.write(f'{key}="{value}"\n')
+
+
 # --- CONFIGURATION & PATHS ---
 CONFIG_FILE = "config.json"
 STORAGE_FILE = "spark_tables_metadata.json"
-CREDENTIALS_FILE = "aws_credentials.json"
-OPENAI_KEY_FILE = "openai_key.json"
+AWS_CREDENTIALS_ENV_PREFIX = "AWS_" # Prefix for environment variables
+OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY" # Changed to an environment variable name
 PROMPTS_FILE = "prompts.json"
 DOWNLOADS_DIR = "spark_downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -40,8 +67,11 @@ def load_app_config():
     }
     try:
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f: return json.load(f)
-    except: pass
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error loading or parsing {CONFIG_FILE}: {e}")
+        pass
     return default
 
 # --- INITIALIZATION ---
@@ -50,26 +80,17 @@ st.set_page_config(page_title=ui_cfg.get("app_title"), layout="wide")
 
 
 def save_openai_key(api_key):
-    """Save OpenAI API key to file"""
-    try:
-        with open(OPENAI_KEY_FILE, 'w') as f:
-            json.dump({'api_key': api_key}, f)
-        return True
-    except Exception as e:
-        st.error(f"Error saving OpenAI key: {e}")
-        return False
+    """(Removed direct file saving) Advise user to set environment variable instead."""
+    # In a real app, you wouldn't directly write to .env from Streamlit for security.
+    # The user is expected to set this themselves.
+    # For now, we'll just set it for the current session.
+    os.environ[OPENAI_API_KEY_ENV_VAR] = api_key
+    return True
 
 
 def load_openai_key():
-    """Load OpenAI API key from file"""
-    try:
-        if os.path.exists(OPENAI_KEY_FILE):
-            with open(OPENAI_KEY_FILE) as f:
-                data = json.load(f)
-                return data.get('api_key')
-    except:
-        pass
-    return None
+    """Load OpenAI API key from environment variable"""
+    return os.getenv(OPENAI_API_KEY_ENV_VAR)
 
 
 def validate_openai_key(api_key):
@@ -157,7 +178,11 @@ def load_prompts():
 
 # --- AI LOGIC (REFACTORED) ---
 def analyze_data_with_ai(table_name, user_question, credentials, api_key, stream=False):
-    """Analyze data using OpenAI with externalized prompts"""
+    """
+    Analyzes data using OpenAI's GPT-4o-mini model.
+    Constructs a prompt based on table schema, sample data, and user's question.
+    Supports streaming responses.
+    """
     try:
         client = OpenAI(api_key=api_key)
         prompts = load_prompts()
@@ -166,27 +191,46 @@ def analyze_data_with_ai(table_name, user_question, credentials, api_key, stream
         df = st.session_state['tables'][table_name]['dataframe']
         context = f"Table: {table_name}\nSchema: {df.schema.simpleString()}\nSample: {df.limit(3).toPandas().to_string()}"
         
+        # Build the system message with context and an optional one-shot example
         system_msg = f"{prompts['system_message']}\n\nCONTEXT:\n{context}"
         if "one_shot_example" in prompts:
             system_msg += f"\n\nEXAMPLE:\n{prompts['one_shot_example']}"
             
+        # Format the user's question using the analysis instruction prompt
         user_msg = prompts["analysis_instruction"].format(table_name=table_name, user_question=user_question)
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        )
-        return response.choices[0].message.content
+        if stream:
+            # Return a generator for streaming responses
+            return client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                stream=True
+            )
+        else:
+            # Return a single, complete response
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+            )
+            return response.choices[0].message.content
     except Exception as e:
-        return f"Error: {str(e)}"
+        # Handle errors, yielding if in streaming mode or returning an error string otherwise
+        if stream:
+            yield {"error": str(e)} # Yield error for stream
+        else:
+            return f"Error: {str(e)}"
 
 
 def analyze_with_query_results(table_name, user_question, query_result, credentials, api_key):
-    """Follow-up analysis using results interpretation prompt"""
+    """
+    Performs follow-up analysis on SQL query results using OpenAI's GPT-4o-mini model.
+    The `results_interpretation` prompt is used to guide the AI's analysis.
+    """
     try:
         client = OpenAI(api_key=api_key)
         prompts = load_prompts()
         
+        # Construct the system prompt using the formatted query results and user question
         system_prompt = prompts["results_interpretation"].format(
             query_result=query_result,
             user_question=user_question
@@ -195,7 +239,7 @@ def analyze_with_query_results(table_name, user_question, query_result, credenti
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": system_prompt}],
-            temperature=0.7
+            temperature=0.7 # Set a moderate temperature for balanced creativity and factual adherence
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -227,10 +271,15 @@ def parse_aws_credentials(credential_text):
 
 
 def save_credentials(credentials):
-    """Save AWS credentials to file"""
+    """Save AWS credentials to environment variables for the current session."""
     try:
-        with open(CREDENTIALS_FILE, 'w') as f:
-            json.dump(credentials, f, indent=2)
+        os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID"] = credentials.get('access_key', '')
+        os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY"] = credentials.get('secret_key', '')
+        if 'session_token' in credentials:
+            os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"] = credentials.get('session_token', '')
+        else:
+            if f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN" in os.environ:
+                del os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"] # Clear if not provided
         return True
     except Exception as e:
         st.error(f"Error saving credentials: {e}")
@@ -238,13 +287,17 @@ def save_credentials(credentials):
 
 
 def load_credentials():
-    """Load AWS credentials from file"""
-    try:
-        if os.path.exists(CREDENTIALS_FILE):
-            with open(CREDENTIALS_FILE) as f:
-                return json.load(f)
-    except:
-        pass
+    """Load AWS credentials from environment variables."""
+    access_key = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID")
+    secret_key = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY")
+    session_token = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN")
+
+    if access_key and secret_key:
+        return {
+            'access_key': access_key,
+            'secret_key': secret_key,
+            'session_token': session_token
+        }
     return None
 
 
@@ -290,10 +343,15 @@ base = "{theme_mode}"
 
 @st.cache_resource
 def get_spark_session(credentials):
-    """Create Spark session with AWS credentials"""
+    """
+    Creates and configures a SparkSession with AWS S3 credentials.
+    Uses st.cache_resource to ensure the SparkSession is created only once.
+    """
     builder = SparkSession.builder.appName(ui_cfg.get("app_title"))
 
     if credentials:
+        # Configure Spark to use Hadoop S3a for S3 connectivity
+        # This requires specific Hadoop and AWS SDK JARs
         builder = builder \
             .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262") \
             .config("spark.hadoop.fs.s3a.access.key", credentials.get('access_key', '')) \
@@ -302,6 +360,7 @@ def get_spark_session(credentials):
             .config("spark.hadoop.fs.s3a.endpoint", "s3.amazonaws.com") \
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
+    # Enable Spark UI and set its port
     return builder \
         .config("spark.ui.enabled", "true") \
         .config("spark.ui.port", "4040") \
@@ -561,92 +620,148 @@ def restore_table(table_name, meta, credentials):
 
 
 def show_openai_setup():
-    """Show OpenAI setup dialog"""
+    """Show OpenAI setup dialog, allowing user to enter key and save to .env file."""
     st.title(ui_cfg.get("header_title"))
     st.markdown("### Enable AI-Powered Data Analysis")
-    st.info("Enter your OpenAI API key to enable AI-powered data analysis features.")
 
-    api_key = st.text_input(
-        "OpenAI API Key:", type="password", placeholder="sk-...")
+    api_key_from_env = load_openai_key()
+    if api_key_from_env:
+        st.success(f"✅ OpenAI API Key loaded from environment variable '{OPENAI_API_KEY_ENV_VAR}'.")
+    else:
+        st.warning(f"Waiting for '{OPENAI_API_KEY_ENV_VAR}' environment variable to be set.")
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("💾 Save & Validate", type="primary"):
+    with st.expander("Enter/Update OpenAI API Key", expanded=not api_key_from_env):
+        st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
+        
+        api_key = st.text_input("OpenAI API Key:", type="password", placeholder="sk-...")
+
+        if st.button("💾 Save to .env and Validate"):
             if api_key.strip():
-                with st.spinner("Validating API key..."):
+                with st.spinner("Validating and saving API key..."):
+                    update_env_file(OPENAI_API_KEY_ENV_VAR, api_key)
+                    # Reload dotenv to get the new key
+                    load_dotenv(override=True)
+                    # Re-validate
                     is_valid, message = validate_openai_key(api_key)
-                if is_valid:
-                    if save_openai_key(api_key):
+                    if is_valid:
                         st.session_state['openai_key'] = api_key
                         st.session_state['show_openai_setup'] = False
                         st.success(f"✅ {message}")
-                        time.sleep(1)
                         st.rerun()
-                else:
-                    st.error(f"❌ {message}")
+                    else:
+                        st.error(f"❌ {message}")
             else:
                 st.error("Please enter an API key")
 
-    with col2:
-        if st.button("⏭️ Skip (Disable AI Features)"):
-            st.session_state['openai_key'] = None
-            st.session_state['show_openai_setup'] = False
-            st.rerun()
+    if st.button("⏭️ Skip (Disable AI Features)", key="skip_ai_setup"):
+        st.session_state['openai_key'] = None
+        st.session_state['show_openai_setup'] = False
+        st.rerun()
 
 
 def show_credentials_setup():
-    """Show credentials setup interface"""
+    """Show AWS credentials setup interface, allowing user to paste and save to .env file."""
     st.title("🔐 AWS Credentials Setup")
-    st.markdown("""
-    ### Welcome to S3 Spark SQL Query Tool!
     
-    To use S3 features, please provide your AWS credentials. You can paste them in the export format:
+    credentials = load_credentials()
+    if credentials:
+        st.success(f"✅ AWS Credentials loaded from environment variables.")
+    else:
+        st.warning(f"Waiting for AWS credentials environment variables to be set (e.g., {AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID).")
     
-    ```bash
-    export AWS_ACCESS_KEY_ID="YOUR_ACCESS_KEY"
-    export AWS_SECRET_ACCESS_KEY="YOUR_SECRET_KEY"
-    export AWS_SESSION_TOKEN="YOUR_SESSION_TOKEN"  # Optional
-    ```
-    """)
+    with st.expander("Enter/Update AWS Credentials", expanded=not credentials):
+        st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
 
-    credentials_text = st.text_area(
-        "Paste your AWS credentials here:",
-        height=200,
-        placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
+        credentials_text = st.text_area(
+            "Paste your AWS credentials here:",
+            height=200,
+            placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_SESSION_TOKEN="..."  # Optional for temporary credentials"""
-    )
+        )
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("💾 Save & Validate", type="primary"):
+        if st.button("💾 Save to .env and Validate"):
             if credentials_text.strip():
-                credentials = parse_aws_credentials(credentials_text)
-                if credentials:
-                    with st.spinner("Validating credentials..."):
-                        is_valid, message = validate_s3_credentials(
-                            credentials)
-                    if is_valid:
-                        if save_credentials(credentials):
-                            st.session_state['credentials'] = credentials
+                parsed_creds = parse_aws_credentials(credentials_text)
+                if parsed_creds:
+                    with st.spinner("Validating and saving credentials..."):
+                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", parsed_creds['access_key'])
+                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", parsed_creds['secret_key'])
+                        if 'session_token' in parsed_creds:
+                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", parsed_creds['session_token'])
+                        
+                        load_dotenv(override=True)
+                        
+                        is_valid, message = validate_s3_credentials(parsed_creds)
+                        
+                        if is_valid:
+                            st.session_state['credentials'] = parsed_creds
                             st.session_state['credentials_validated'] = True
                             st.success(f"✅ {message}")
                             st.rerun()
                         else:
-                            st.error("Failed to save credentials")
-                    else:
-                        st.error(f"❌ {message}")
+                            st.error(f"❌ {message}")
                 else:
-                    st.error(
-                        "Could not parse credentials. Please check the format.")
+                    st.error("Could not parse credentials. Please check the format.")
             else:
-                st.error("Please enter your credentials")
+                st.error("Please paste your credentials.")
 
-    with col2:
-        if st.button("⏭️ Skip (Local Files Only)"):
-            st.session_state['credentials'] = None
-            st.session_state['credentials_validated'] = False
-            st.rerun()
+    if st.button("⏭️ Skip (Local Files Only)", key="skip_aws_setup"):
+        st.session_state['credentials'] = None
+        st.session_state['credentials_validated'] = False
+        st.session_state['skip_credentials'] = True
+        st.rerun()
+
+
+def _display_conversation_entry(conv_num, conv_entry):
+    """Helper function to display a single AI conversation entry."""
+    with st.container():
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            if 'question' in conv_entry:
+                st.markdown(f"**#{conv_num} - Table: {conv_entry['table']}**")
+            elif 'query' in conv_entry:
+                st.markdown(f"**#{conv_num} - Query Results Analysis**")
+            elif 'type' in conv_entry and conv_entry['type'] == 'sql_analysis':
+                st.markdown(f"**#{conv_num} - SQL Results Analysis**")
+
+        with col2:
+            expand_key = f"expand_conv_{conv_num}"
+            if expand_key not in st.session_state:
+                st.session_state[expand_key] = False
+
+            if st.button("🔍" if not st.session_state[expand_key] else "🔼",
+                         key=f"btn_expand_{conv_num}",
+                         help="Expand/Collapse"):
+                st.session_state[expand_key] = not st.session_state[expand_key]
+                st.rerun()
+
+        if 'question' in conv_entry:
+            st.markdown(f"**Q:** {conv_entry['question']}")
+            if st.session_state.get(expand_key, False):
+                st.markdown("**A:**")
+                st.markdown(conv_entry['response'])
+            else:
+                response_preview = conv_entry['response'][:300] + "..." if len(conv_entry['response']) > 300 else conv_entry['response']
+                st.markdown(f"**A:** {response_preview}")
+        elif 'query' in conv_entry:
+            st.code(conv_entry['query'], language="sql")
+            if st.session_state.get(expand_key, False):
+                st.markdown("**Analysis:**")
+                st.markdown(conv_entry['analysis'])
+            else:
+                analysis_preview = conv_entry['analysis'][:300] + "..." if len(conv_entry['analysis']) > 300 else conv_entry['analysis']
+                st.markdown(f"**Analysis:** {analysis_preview}")
+        elif 'type' in conv_entry and conv_entry['type'] == 'sql_analysis':
+            st.code(conv_entry['query'], language="sql")
+            if st.session_state.get(expand_key, False):
+                st.markdown("**Full Analysis:**")
+                st.markdown(conv_entry['analysis'])
+            else:
+                analysis_preview = conv_entry['analysis'][:300] + "..." if len(conv_entry['analysis']) > 300 else conv_entry['analysis']
+                st.markdown(f"**Analysis:** {analysis_preview}")
+
+        st.markdown("---")
 
 
 def main():
@@ -855,8 +970,7 @@ def main():
 
         if analyze_button and user_question.strip():
             with st.spinner("🤔 AI is analyzing your data..."):
-                # Get initial analysis
-                response_stream = analyze_data_with_ai(
+                response_generator = analyze_data_with_ai(
                     selected_table,
                     user_question,
                     st.session_state['credentials'],
@@ -864,14 +978,17 @@ def main():
                     stream=True
                 )
 
-                # Display streaming response
                 response_placeholder = st.empty()
                 full_response = ""
 
-                for chunk in response_stream:
-                    if chunk.choices[0].delta.content:
+                for chunk in response_generator:
+                    if hasattr(chunk, 'choices') and chunk.choices[0].delta.content:
                         full_response += chunk.choices[0].delta.content
                         response_placeholder.markdown(full_response + "▌")
+                    elif isinstance(chunk, dict) and "error" in chunk: # Handle error from streamed response
+                        st.error(f"Error during AI analysis: {chunk['error']}")
+                        full_response = f"Error during AI analysis: {chunk['error']}"
+                        break # Stop processing chunks if an error occurs
 
                 response_placeholder.markdown(full_response)
 
@@ -939,97 +1056,8 @@ def main():
         if st.session_state['ai_conversation']:
             with st.expander("📜 Conversation History", expanded=False):
                 for idx, conv in enumerate(reversed(st.session_state['ai_conversation']), 1):
-                    conv_num = len(
-                        st.session_state['ai_conversation']) - idx + 1
-
-                    if 'question' in conv:
-                        with st.container():
-                            col1, col2 = st.columns([5, 1])
-                            with col1:
-                                st.markdown(
-                                    f"**#{conv_num} - Table: {conv['table']}**")
-                            with col2:
-                                expand_key = f"expand_conv_{conv_num}"
-                                if expand_key not in st.session_state:
-                                    st.session_state[expand_key] = False
-
-                                if st.button("🔍" if not st.session_state[expand_key] else "🔼",
-                                             key=f"btn_expand_{conv_num}",
-                                             help="Expand/Collapse"):
-                                    st.session_state[expand_key] = not st.session_state[expand_key]
-                                    st.rerun()
-
-                            st.markdown(f"**Q:** {conv['question']}")
-
-                            if st.session_state.get(expand_key, False):
-                                st.markdown("**A:**")
-                                st.markdown(conv['response'])
-                            else:
-                                response_preview = conv['response'][:300] + "..." if len(
-                                    conv['response']) > 300 else conv['response']
-                                st.markdown(f"**A:** {response_preview}")
-
-                            st.markdown("---")
-
-                    elif 'query' in conv:
-                        with st.container():
-                            col1, col2 = st.columns([5, 1])
-                            with col1:
-                                st.markdown(
-                                    f"**#{conv_num} - Query Results Analysis**")
-                            with col2:
-                                expand_key = f"expand_conv_{conv_num}"
-                                if expand_key not in st.session_state:
-                                    st.session_state[expand_key] = False
-
-                                if st.button("🔍" if not st.session_state[expand_key] else "🔼",
-                                             key=f"btn_expand_{conv_num}",
-                                             help="Expand/Collapse"):
-                                    st.session_state[expand_key] = not st.session_state[expand_key]
-                                    st.rerun()
-
-                            st.code(conv['query'], language="sql")
-
-                            if st.session_state.get(expand_key, False):
-                                st.markdown("**Analysis:**")
-                                st.markdown(conv['analysis'])
-                            else:
-                                analysis_preview = conv['analysis'][:300] + "..." if len(
-                                    conv['analysis']) > 300 else conv['analysis']
-                                st.markdown(
-                                    f"**Analysis:** {analysis_preview}")
-
-                            st.markdown("---")
-
-                    elif 'type' in conv and conv['type'] == 'sql_analysis':
-                        with st.container():
-                            col1, col2 = st.columns([5, 1])
-                            with col1:
-                                st.markdown(
-                                    f"**#{conv_num} - SQL Results Analysis**")
-                            with col2:
-                                expand_key = f"expand_conv_{conv_num}"
-                                if expand_key not in st.session_state:
-                                    st.session_state[expand_key] = False
-
-                                if st.button("🔍" if not st.session_state[expand_key] else "🔼",
-                                             key=f"btn_expand_{conv_num}",
-                                             help="Expand/Collapse"):
-                                    st.session_state[expand_key] = not st.session_state[expand_key]
-                                    st.rerun()
-
-                            st.code(conv['query'], language="sql")
-
-                            if st.session_state.get(expand_key, False):
-                                st.markdown("**Full Analysis:**")
-                                st.markdown(conv['analysis'])
-                            else:
-                                analysis_preview = conv['analysis'][:300] + "..." if len(
-                                    conv['analysis']) > 300 else conv['analysis']
-                                st.markdown(
-                                    f"**Analysis:** {analysis_preview}")
-
-                            st.markdown("---")
+                    conv_num = len(st.session_state['ai_conversation']) - idx + 1
+                    _display_conversation_entry(conv_num, conv)
 
         st.markdown("---")
 

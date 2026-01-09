@@ -1,13 +1,17 @@
-# Credentials & Secrets
+# Credentials
 aws_credentials.json
 openai_key.json
-spark_tables_metadata.json
+*.env
 
-# Local Data Storage
-spark_downloads/
-.streamlit/config.toml
-
-# Python artifacts
+# Python
 __pycache__/
 venv/
-.env
+*.py[cod]
+.ipynb_checkpoints/
+
+# Spark/Hadoop
+spark-warehouse/
+metastore_db/
+spark_tables_metadata.json
+
+smartspark.egg-info/*
