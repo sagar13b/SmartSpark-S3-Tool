@@ -660,7 +660,7 @@ def show_openai_setup():
 
 
 def show_credentials_setup():
-    """Show AWS credentials setup interface, allowing user to paste and save to .env file."""
+    """Show AWS credentials setup interface, allowing user to paste or enter manually."""
     st.title("🔐 AWS Credentials Setup")
     
     credentials = load_credentials()
@@ -672,39 +672,75 @@ def show_credentials_setup():
     with st.expander("Enter/Update AWS Credentials", expanded=not credentials):
         st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
 
-        credentials_text = st.text_area(
-            "Paste your AWS credentials here:",
-            height=200,
-            placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
+        input_method = st.radio("Choose input method:", ["Paste Credentials", "Enter Manually"])
+
+        if input_method == "Paste Credentials":
+            credentials_text = st.text_area(
+                "Paste your AWS credentials here:",
+                height=200,
+                placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_SESSION_TOKEN="..."  # Optional for temporary credentials"""
-        )
+            )
 
-        if st.button("💾 Save to .env and Validate"):
-            if credentials_text.strip():
-                parsed_creds = parse_aws_credentials(credentials_text)
-                if parsed_creds:
+            if st.button("💾 Save to .env and Validate"):
+                if credentials_text.strip():
+                    parsed_creds = parse_aws_credentials(credentials_text)
+                    if parsed_creds:
+                        with st.spinner("Validating and saving credentials..."):
+                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", parsed_creds['access_key'])
+                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", parsed_creds['secret_key'])
+                            if 'session_token' in parsed_creds:
+                                update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", parsed_creds['session_token'])
+                            
+                            load_dotenv(override=True)
+                            
+                            is_valid, message = validate_s3_credentials(parsed_creds)
+                            
+                            if is_valid:
+                                st.session_state['credentials'] = parsed_creds
+                                st.session_state['credentials_validated'] = True
+                                st.success(f"✅ {message}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+                    else:
+                        st.error("Could not parse credentials. Please check the format.")
+                else:
+                    st.error("Please paste your credentials.")
+        
+        else: # Enter Manually
+            aws_access_key = st.text_input("AWS Access Key ID:", placeholder="ASIA...")
+            aws_secret_key = st.text_input("AWS Secret Access Key:", type="password")
+            aws_session_token = st.text_input("AWS Session Token (optional):", type="password")
+
+            if st.button("💾 Save to .env and Validate"):
+                if aws_access_key.strip() and aws_secret_key.strip():
+                    new_creds = {
+                        'access_key': aws_access_key,
+                        'secret_key': aws_secret_key,
+                        'session_token': aws_session_token if aws_session_token.strip() else None
+                    }
+                    
                     with st.spinner("Validating and saving credentials..."):
-                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", parsed_creds['access_key'])
-                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", parsed_creds['secret_key'])
-                        if 'session_token' in parsed_creds:
-                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", parsed_creds['session_token'])
+                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", aws_access_key)
+                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", aws_secret_key)
+                        if aws_session_token.strip():
+                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", aws_session_token)
                         
                         load_dotenv(override=True)
                         
-                        is_valid, message = validate_s3_credentials(parsed_creds)
+                        is_valid, message = validate_s3_credentials(new_creds)
                         
                         if is_valid:
-                            st.session_state['credentials'] = parsed_creds
+                            st.session_state['credentials'] = new_creds
                             st.session_state['credentials_validated'] = True
                             st.success(f"✅ {message}")
                             st.rerun()
                         else:
                             st.error(f"❌ {message}")
                 else:
-                    st.error("Could not parse credentials. Please check the format.")
-            else:
-                st.error("Please paste your credentials.")
+                    st.error("Please enter both AWS Access Key ID and Secret Access Key.")
 
     if st.button("⏭️ Skip (Local Files Only)", key="skip_aws_setup"):
         st.session_state['credentials'] = None
