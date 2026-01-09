@@ -1,0 +1,7 @@
+streamlit
+pandas
+pyspark
+boto3
+botocore
+psutil
+openai

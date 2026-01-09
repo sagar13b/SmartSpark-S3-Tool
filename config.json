@@ -1,0 +1,9 @@
+{
+    "app_title": "SmartSpark S3 AI Explorer",
+    "app_icon": "🔍",
+    "header_title": "🔍 S3 Spark SQL Query Tool",
+    "sidebar_header": "⚙️ App Settings",
+    "ai_section_title": "🤖 AI Data Analysis",
+    "ai_placeholder_question": "Examples:\n- What are the top 10 customers by revenue?\n- Show me sales trends over time...",
+    "theme_default": "light"
+}

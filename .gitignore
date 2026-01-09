@@ -1,0 +1,13 @@
+# Credentials & Secrets
+aws_credentials.json
+openai_key.json
+spark_tables_metadata.json
+
+# Local Data Storage
+spark_downloads/
+.streamlit/config.toml
+
+# Python artifacts
+__pycache__/
+venv/
+.env
