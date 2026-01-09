@@ -16,6 +16,7 @@ from openai import OpenAI
 
 
 # --- CONFIGURATION & PATHS ---
+CONFIG_FILE = "config.json"
 STORAGE_FILE = "spark_tables_metadata.json"
 CREDENTIALS_FILE = "aws_credentials.json"
 OPENAI_KEY_FILE = "openai_key.json"
@@ -26,6 +27,26 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 # Configuration files
 STREAMLIT_CONFIG_DIR = Path.home() / ".streamlit"
 STREAMLIT_CONFIG_FILE = STREAMLIT_CONFIG_DIR / "config.toml"
+
+
+# --- CONFIG LOADERS ---
+def load_app_config():
+    """Load UI settings like Title and Headers"""
+    default = {
+        "app_title": "S3 Spark Tool",
+        "header_title": "🔍 S3 Spark SQL Query Tool",
+        "sidebar_header": "⚙️ Settings",
+        "ai_section_title": "🤖 AI Data Analysis"
+    }
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f: return json.load(f)
+    except: pass
+    return default
+
+# --- INITIALIZATION ---
+ui_cfg = load_app_config()
+st.set_page_config(page_title=ui_cfg.get("app_title"), layout="wide")
 
 
 def save_openai_key(api_key):
@@ -140,33 +161,22 @@ def analyze_data_with_ai(table_name, user_question, credentials, api_key, stream
     try:
         client = OpenAI(api_key=api_key)
         prompts = load_prompts()
-        table_summary = get_table_summary(table_name, credentials)
-
-        # Build the system context
-        system_content = f"{prompts['system_message']}\n\nDATA CONTEXT:\n{table_summary}"
         
-        # Inject One-Shot Example if it exists
-        if prompts.get("one_shot_example"):
-            system_content += f"\n\n{prompts['one_shot_example']}"
-
-        # Build user prompt
-        user_content = prompts["analysis_instruction"].format(
-            table_name=table_name, 
-            user_question=user_question
-        )
-
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content}
-        ]
+        # Get table context (Schema + Sample)
+        df = st.session_state['tables'][table_name]['dataframe']
+        context = f"Table: {table_name}\nSchema: {df.schema.simpleString()}\nSample: {df.limit(3).toPandas().to_string()}"
+        
+        system_msg = f"{prompts['system_message']}\n\nCONTEXT:\n{context}"
+        if "one_shot_example" in prompts:
+            system_msg += f"\n\nEXAMPLE:\n{prompts['one_shot_example']}"
+            
+        user_msg = prompts["analysis_instruction"].format(table_name=table_name, user_question=user_question)
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=messages,
-            stream=stream,
-            temperature=0.7
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
         )
-        return response
+        return response.choices[0].message.content
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -274,10 +284,14 @@ base = "{theme_mode}"
         f.write(config_content)
 
 
+# --- SPARK ARCHITECTURE ---
+# Spark uses a Master-Worker architecture. Even on a local machine, 
+# it manages memory through a Driver process and Executor threads.
+
 @st.cache_resource
 def get_spark_session(credentials):
     """Create Spark session with AWS credentials"""
-    builder = SparkSession.builder.appName("S3 Query Tool")
+    builder = SparkSession.builder.appName(ui_cfg.get("app_title"))
 
     if credentials:
         builder = builder \
@@ -285,7 +299,7 @@ def get_spark_session(credentials):
             .config("spark.hadoop.fs.s3a.access.key", credentials.get('access_key', '')) \
             .config("spark.hadoop.fs.s3a.secret.key", credentials.get('secret_key', '')) \
             .config("spark.hadoop.fs.s3a.session.token", credentials.get('session_token', '')) \
-            .config("spark.hadoop.fs.s3a.endpoint", "s3.us-east-1.amazonaws.com") \
+            .config("spark.hadoop.fs.s3a.endpoint", "s3.amazonaws.com") \
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
     return builder \
@@ -548,7 +562,7 @@ def restore_table(table_name, meta, credentials):
 
 def show_openai_setup():
     """Show OpenAI setup dialog"""
-    st.title("🤖 AI Analysis Setup")
+    st.title(ui_cfg.get("header_title"))
     st.markdown("### Enable AI-Powered Data Analysis")
     st.info("Enter your OpenAI API key to enable AI-powered data analysis features.")
 
@@ -672,7 +686,7 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header(ui_cfg.get("sidebar_header"))
 
         # Theme toggle
         current_theme = st.session_state.get('theme', 'light')
@@ -816,7 +830,7 @@ def main():
 
     # AI Analysis Section (if OpenAI is set up and tables exist)
     if st.session_state['openai_key'] and st.session_state['tables']:
-        st.subheader("🤖 AI Data Analysis")
+        st.subheader(ui_cfg.get("ai_section_title"))
 
         selected_table = st.selectbox(
             "Select table for AI analysis:",

@@ -1,11 +1,12 @@
 #!/bin/bash
+echo "🚀 Initializing SmartSpark Repository..."
 
-# 1. Create Virtual Environment
+# Create Virtual Env
 echo "Creating virtual environment..."
 python3 -m venv venv
 source venv/bin/activate
 
-# 2. Install Python Dependencies
+# Install requirements
 echo "Installing dependencies..."
 pip install --upgrade pip
 pip install streamlit pandas pyspark boto3 botocore psutil openai
@@ -17,4 +18,9 @@ else
     echo "WARNING: Java not found. Please install JDK 11 to use Spark."
 fi
 
-echo "Setup complete. Start the app with: streamlit run app.py"
+# Create placeholder config if missing
+if [ ! -f config.json ]; then
+  echo '{"app_title": "My Spark Tool"}' > config.json
+fi
+
+echo "✅ Ready! Run: source venv/bin/activate && streamlit run app.py"
