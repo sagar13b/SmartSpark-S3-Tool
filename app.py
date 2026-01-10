@@ -50,6 +50,8 @@ OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY" # Changed to an environment variable n
 PROMPTS_FILE = "prompts.json"
 DOWNLOADS_DIR = "spark_downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+TEMP_DATA_DIR = "temp_data"
+os.makedirs(TEMP_DATA_DIR, exist_ok=True)
 
 # Configuration files
 STREAMLIT_CONFIG_DIR = Path.home() / ".streamlit"
@@ -376,14 +378,15 @@ def get_system_resources():
     app_mem = process.memory_info().rss
 
     app_disk_usage = 0
-    if os.path.exists(DOWNLOADS_DIR):
-        for dirpath, dirnames, filenames in os.walk(DOWNLOADS_DIR):
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                try:
-                    app_disk_usage += os.path.getsize(filepath)
-                except:
-                    pass
+    for folder in [DOWNLOADS_DIR, TEMP_DATA_DIR]:
+        if os.path.exists(folder):
+            for dirpath, dirnames, filenames in os.walk(folder):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    try:
+                        app_disk_usage += os.path.getsize(filepath)
+                    except:
+                        pass
 
     return {
         'total_mem': mem.total,
@@ -976,8 +979,48 @@ def main():
             st.session_state['tables'] = {}
             st.rerun()
 
+        st.markdown("---")
+        if st.button("🗑️ Clear Temporary Files", use_container_width=True):
+            try:
+                shutil.rmtree(TEMP_DATA_DIR)
+                os.makedirs(TEMP_DATA_DIR, exist_ok=True)
+                st.success("✅ Temporary files cleared!")
+            except Exception as e:
+                st.error(f"Error clearing temporary files: {e}")
+
     # Main area
     st.title("🔍 S3 Spark SQL Query Tool")
+
+    with st.expander("💻 System Resources", expanded=True):
+        # Create placeholders for the metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**📊 Memory (RAM)**")
+            mem_bar = st.progress(0)
+            mem_text = st.caption("")
+        with col2:
+            st.markdown("**💾 Disk Storage**")
+            disk_bar = st.progress(0)
+            disk_text = st.caption("")
+
+        # Live update loop
+        while True:
+            resources = get_system_resources()
+            
+            mem_pct = (resources['used_mem'] / resources['total_mem']) * 100
+            mem_bar.progress(int(mem_pct))
+            mem_text.caption(
+                f"Used: {format_bytes(resources['used_mem'])} / {format_bytes(resources['total_mem'])} ({mem_pct:.1f}%) | "
+                f"App: {format_bytes(resources['app_mem'])}"
+            )
+
+            disk_pct = (resources['used_disk'] / resources['total_disk']) * 100
+            disk_bar.progress(int(disk_pct))
+            disk_text.caption(
+                f"Used: {format_bytes(resources['used_disk'])} / {format_bytes(resources['total_disk'])} ({disk_pct:.1f}%) | "
+                f"App: {format_bytes(resources['app_disk'])}"
+            )
+            time.sleep(1)
 
     # AI Analysis Section (if OpenAI is set up and tables exist)
     if st.session_state['openai_key'] and st.session_state['tables']:
@@ -1384,7 +1427,7 @@ Format your response with clear sections using markdown."""}
                 st.error(f"Table '{table_name}' already loaded")
             else:
                 try:
-                    temp_dir = tempfile.mkdtemp()
+                    temp_dir = tempfile.mkdtemp(dir=TEMP_DATA_DIR)
                     files = []
                     total_size = 0
 
@@ -1446,35 +1489,6 @@ Format your response with clear sections using markdown."""}
                         st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
-
-    # System Resources at bottom (manual refresh only)
-    st.markdown("---")
-    with st.expander("💻 System Resources", expanded=False):
-        if st.button("🔄 Refresh Resources"):
-            resources = get_system_resources()
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.markdown("**📊 Memory (RAM)**")
-                mem_pct = (resources['used_mem'] /
-                           resources['total_mem']) * 100
-                st.progress(mem_pct / 100)
-                st.caption(
-                    f"Used: {format_bytes(resources['used_mem'])} / {format_bytes(resources['total_mem'])} ({mem_pct:.1f}%)")
-                st.caption(
-                    f"└─ This App: {format_bytes(resources['app_mem'])}")
-
-            with col2:
-                st.markdown("**💾 Disk Storage**")
-                disk_pct = (resources['used_disk'] /
-                            resources['total_disk']) * 100
-                st.progress(disk_pct / 100)
-                st.caption(
-                    f"Used: {format_bytes(resources['used_disk'])} / {format_bytes(resources['total_disk'])} ({disk_pct:.1f}%)")
-                st.caption(
-                    f"└─ This App: {format_bytes(resources['app_disk'])}")
-
 
 if __name__ == "__main__":
     main()
