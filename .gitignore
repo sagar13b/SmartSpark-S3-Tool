@@ -15,3 +15,5 @@ metastore_db/
 spark_tables_metadata.json
 
 smartspark.egg-info/*
+temp_data/*
+.streamlit/*

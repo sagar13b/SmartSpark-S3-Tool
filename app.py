@@ -1,21 +1,19 @@
+from openai import OpenAI
+import re
+import time
+import psutil
+from pathlib import Path
+from datetime import datetime
+import json
+import shutil
+import os
+import tempfile
+from botocore.exceptions import ClientError
+import boto3
+from pyspark.sql import SparkSession
+import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
-
-import streamlit as st
-import pandas as pd
-from pyspark.sql import SparkSession
-import boto3
-from botocore.exceptions import ClientError
-import tempfile
-import os
-import shutil
-import json
-from datetime import datetime
-from pathlib import Path
-import psutil
-import time
-import re
-from openai import OpenAI
 
 
 def update_env_file(key, value):
@@ -45,8 +43,9 @@ def update_env_file(key, value):
 # --- CONFIGURATION & PATHS ---
 CONFIG_FILE = "config.json"
 STORAGE_FILE = "spark_tables_metadata.json"
-AWS_CREDENTIALS_ENV_PREFIX = "AWS_" # Prefix for environment variables
-OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY" # Changed to an environment variable name
+AWS_CREDENTIALS_ENV_PREFIX = "AWS_"
+AZURE_CREDENTIALS_ENV_PREFIX = "AZURE_"
+OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY"
 PROMPTS_FILE = "prompts.json"
 DOWNLOADS_DIR = "spark_downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -54,8 +53,9 @@ TEMP_DATA_DIR = "temp_data"
 os.makedirs(TEMP_DATA_DIR, exist_ok=True)
 
 # Configuration files
-STREAMLIT_CONFIG_DIR = Path.home() / ".streamlit"
-STREAMLIT_CONFIG_FILE = STREAMLIT_CONFIG_DIR / "config.toml"
+STREAMLIT_CONFIG_DIR = ".streamlit"
+os.makedirs(STREAMLIT_CONFIG_DIR, exist_ok=True)
+STREAMLIT_CONFIG_FILE = Path(".streamlit/config.toml")
 
 
 # --- CONFIG LOADERS ---
@@ -76,6 +76,7 @@ def load_app_config():
         pass
     return default
 
+
 # --- INITIALIZATION ---
 ui_cfg = load_app_config()
 st.set_page_config(page_title=ui_cfg.get("app_title"), layout="wide")
@@ -83,9 +84,6 @@ st.set_page_config(page_title=ui_cfg.get("app_title"), layout="wide")
 
 def save_openai_key(api_key):
     """(Removed direct file saving) Advise user to set environment variable instead."""
-    # In a real app, you wouldn't directly write to .env from Streamlit for security.
-    # The user is expected to set this themselves.
-    # For now, we'll just set it for the current session.
     os.environ[OPENAI_API_KEY_ENV_VAR] = api_key
     return True
 
@@ -99,7 +97,6 @@ def validate_openai_key(api_key):
     """Validate OpenAI API key"""
     try:
         client = OpenAI(api_key=api_key)
-        # Test with a simple request
         client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": "test"}],
@@ -110,27 +107,29 @@ def validate_openai_key(api_key):
         return False, f"Invalid API key: {str(e)}"
 
 
-def get_table_summary(table_name, credentials):
-    """Get comprehensive summary of table for AI context"""
+def get_table_summary_spark(table_name, credentials):
+    """Get comprehensive summary of table for AI context using pure Spark"""
     try:
         table_info = st.session_state['tables'][table_name]
         spark = get_spark_session(credentials)
         df = table_info['dataframe']
 
-        # Get sample data
-        sample_data = df.limit(5).toPandas()
+        # Get sample data using Spark
+        sample_rows = df.limit(5).collect()
+        sample_data = "\n".join([str(row.asDict()) for row in sample_rows])
 
-        # Get column statistics
+        # Get numeric columns
         numeric_cols = [f.name for f in df.schema.fields if str(f.dataType) in [
             'IntegerType', 'LongType', 'FloatType', 'DoubleType', 'DecimalType']]
-        stats_summary = ""
 
+        stats_summary = ""
         if numeric_cols:
             stats_df = df.select(numeric_cols).summary(
-                "count", "mean", "stddev", "min", "max").toPandas()
-            stats_summary = stats_df.to_string()
+                "count", "mean", "stddev", "min", "max")
+            stats_rows = stats_df.collect()
+            stats_summary = "\n".join([str(row.asDict())
+                                      for row in stats_rows])
 
-        # Build summary
         summary = f"""
 TABLE: {table_name}
 Total Rows: {table_info['row_count']:,}
@@ -140,7 +139,7 @@ SCHEMA:
 {chr(10).join([f"- {col['name']}: {col['type']}" for col in table_info['schema']])}
 
 SAMPLE DATA (first 5 rows):
-{sample_data.to_string()}
+{sample_data}
 
 NUMERIC COLUMN STATISTICS:
 {stats_summary if stats_summary else "No numeric columns"}
@@ -151,12 +150,13 @@ NUMERIC COLUMN STATISTICS:
 
 
 def execute_query_for_ai(query, credentials):
-    """Execute a SQL query and return results as string"""
+    """Execute a SQL query and return results as string using Spark"""
     try:
         spark = get_spark_session(credentials)
         result = spark.sql(query)
-        pdf = result.limit(100).toPandas()
-        return True, pdf.to_string(), len(pdf)
+        rows = result.limit(100).collect()
+        result_str = "\n".join([str(row.asDict()) for row in rows])
+        return True, result_str, len(rows)
     except Exception as e:
         return False, str(e), 0
 
@@ -165,10 +165,10 @@ def execute_query_for_ai(query, credentials):
 def load_prompts():
     """Load AI prompts from external JSON file with fallback defaults"""
     default_prompts = {
-        "system_message": "You are a professional Data Analyst.",
-        "one_shot_example": "",
-        "analysis_instruction": "Analyze this table: {table_name}. Question: {user_question}",
-        "results_interpretation": "Interpret these results: {query_result}"
+        "system_message": "You are a professional Data Analyst with expertise in SQL and data analysis.",
+        "one_shot_example": "Example: When asked 'What are the top 5 products by revenue?', analyze the schema and provide: 'Based on the data, I'll write a query to find the top 5 products:\n```sql\nSELECT product_name, SUM(revenue) as total_revenue\nFROM sales_table\nGROUP BY product_name\nORDER BY total_revenue DESC\nLIMIT 5\n```\nThis query groups sales by product and returns the highest earners.'",
+        "analysis_instruction": "Analyze this table: {table_name}\n\nUser Question: {user_question}\n\nProvide a clear answer. If you need to query the data, include a SQL query in a ```sql code block.",
+        "results_interpretation": "Query Results:\n{query_result}\n\nOriginal Question: {user_question}\n\nInterpret these results and provide actionable insights."
     }
     try:
         if os.path.exists(PROMPTS_FILE):
@@ -178,47 +178,73 @@ def load_prompts():
         st.error(f"Error loading prompts.json: {e}")
     return default_prompts
 
-# --- AI LOGIC (REFACTORED) ---
+
+# --- AI LOGIC (REFACTORED & FIXED) ---
 def analyze_data_with_ai(table_name, user_question, credentials, api_key, stream=False):
     """
     Analyzes data using OpenAI's GPT-4o-mini model.
-    Constructs a prompt based on table schema, sample data, and user's question.
-    Supports streaming responses.
+    Uses pure Spark instead of pandas
     """
     try:
         client = OpenAI(api_key=api_key)
         prompts = load_prompts()
-        
-        # Get table context (Schema + Sample)
+
+        # Get richer table context
         df = st.session_state['tables'][table_name]['dataframe']
-        context = f"Table: {table_name}\nSchema: {df.schema.simpleString()}\nSample: {df.limit(3).toPandas().to_string()}"
-        
-        # Build the system message with context and an optional one-shot example
-        system_msg = f"{prompts['system_message']}\n\nCONTEXT:\n{context}"
-        if "one_shot_example" in prompts:
-            system_msg += f"\n\nEXAMPLE:\n{prompts['one_shot_example']}"
-            
-        # Format the user's question using the analysis instruction prompt
-        user_msg = prompts["analysis_instruction"].format(table_name=table_name, user_question=user_question)
+        table_info = st.session_state['tables'][table_name]
+
+        # Build comprehensive context using Spark
+        schema_str = "\n".join(
+            [f"  - {col['name']}: {col['type']}" for col in table_info['schema']])
+
+        # Get sample data using Spark collect
+        sample_rows = df.limit(10).collect()
+        sample_str = "\n".join([str(row.asDict()) for row in sample_rows])
+
+        context = f"""Table: {table_name}
+Total Rows: {table_info['row_count']:,}
+Total Columns: {table_info['col_count']}
+
+Schema:
+{schema_str}
+
+Sample Data (first 10 rows):
+{sample_str}
+"""
+
+        # Build messages
+        system_msg = f"{prompts['system_message']}\n\nAVAILABLE DATA:\n{context}"
+        if prompts.get("one_shot_example"):
+            system_msg += f"\n\n{prompts['one_shot_example']}"
+
+        user_msg = prompts["analysis_instruction"].format(
+            table_name=table_name,
+            user_question=user_question
+        )
 
         if stream:
-            # Return a generator for streaming responses
             return client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.7,
                 stream=True
             )
         else:
-            # Return a single, complete response
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.7
             )
             return response.choices[0].message.content
     except Exception as e:
-        # Handle errors, yielding if in streaming mode or returning an error string otherwise
         if stream:
-            yield {"error": str(e)} # Yield error for stream
+            yield {"error": str(e)}
         else:
             return f"Error: {str(e)}"
 
@@ -226,13 +252,11 @@ def analyze_data_with_ai(table_name, user_question, credentials, api_key, stream
 def analyze_with_query_results(table_name, user_question, query_result, credentials, api_key):
     """
     Performs follow-up analysis on SQL query results using OpenAI's GPT-4o-mini model.
-    The `results_interpretation` prompt is used to guide the AI's analysis.
     """
     try:
         client = OpenAI(api_key=api_key)
         prompts = load_prompts()
-        
-        # Construct the system prompt using the formatted query results and user question
+
         system_prompt = prompts["results_interpretation"].format(
             query_result=query_result,
             user_question=user_question
@@ -241,7 +265,7 @@ def analyze_with_query_results(table_name, user_question, query_result, credenti
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": system_prompt}],
-            temperature=0.7 # Set a moderate temperature for balanced creativity and factual adherence
+            temperature=0.7
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -272,34 +296,87 @@ def parse_aws_credentials(credential_text):
         return None
 
 
-def save_credentials(credentials):
-    """Save AWS credentials to environment variables for the current session."""
+def parse_azure_credentials(credential_text):
+    """Parse Azure credentials from export format"""
     try:
-        os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID"] = credentials.get('access_key', '')
-        os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY"] = credentials.get('secret_key', '')
-        if 'session_token' in credentials:
-            os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"] = credentials.get('session_token', '')
+        credentials = {}
+        patterns = {
+            'account_name': r'export\s+AZURE_STORAGE_ACCOUNT\s*=\s*["\']([^"\']+)["\']',
+            'account_key': r'export\s+AZURE_STORAGE_KEY\s*=\s*["\']([^"\']+)["\']',
+            'container': r'export\s+AZURE_CONTAINER\s*=\s*["\']([^"\']+)["\']',
+        }
+
+        for key, pattern in patterns.items():
+            match = re.search(pattern, credential_text,
+                              re.IGNORECASE | re.MULTILINE)
+            if match:
+                credentials[key] = match.group(1)
+
+        if 'account_name' in credentials and 'account_key' in credentials:
+            return credentials
         else:
-            if f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN" in os.environ:
-                del os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"] # Clear if not provided
+            return None
+    except Exception as e:
+        return None
+
+
+def save_credentials(credentials, cloud_type='aws'):
+    """Save cloud credentials to environment variables for the current session."""
+    try:
+        if cloud_type == 'aws':
+            os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID"] = credentials.get(
+                'access_key', '')
+            os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY"] = credentials.get(
+                'secret_key', '')
+            if 'session_token' in credentials:
+                os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"] = credentials.get(
+                    'session_token', '')
+            else:
+                if f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN" in os.environ:
+                    del os.environ[f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN"]
+        elif cloud_type == 'azure':
+            os.environ[f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_ACCOUNT"] = credentials.get(
+                'account_name', '')
+            os.environ[f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_KEY"] = credentials.get(
+                'account_key', '')
+            if 'container' in credentials:
+                os.environ[f"{AZURE_CREDENTIALS_ENV_PREFIX}CONTAINER"] = credentials.get(
+                    'container', '')
         return True
     except Exception as e:
         st.error(f"Error saving credentials: {e}")
         return False
 
 
-def load_credentials():
-    """Load AWS credentials from environment variables."""
-    access_key = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID")
-    secret_key = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY")
-    session_token = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN")
+def load_credentials(cloud_type='aws'):
+    """Load cloud credentials from environment variables."""
+    if cloud_type == 'aws':
+        access_key = os.getenv(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID")
+        secret_key = os.getenv(
+            f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY")
+        session_token = os.getenv(
+            f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN")
 
-    if access_key and secret_key:
-        return {
-            'access_key': access_key,
-            'secret_key': secret_key,
-            'session_token': session_token
-        }
+        if access_key and secret_key:
+            return {
+                'access_key': access_key,
+                'secret_key': secret_key,
+                'session_token': session_token,
+                'type': 'aws'
+            }
+    elif cloud_type == 'azure':
+        account_name = os.getenv(
+            f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_ACCOUNT")
+        account_key = os.getenv(f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_KEY")
+        container = os.getenv(f"{AZURE_CREDENTIALS_ENV_PREFIX}CONTAINER")
+
+        if account_name and account_key:
+            return {
+                'account_name': account_name,
+                'account_key': account_key,
+                'container': container,
+                'type': 'azure'
+            }
     return None
 
 
@@ -329,40 +406,84 @@ def validate_s3_credentials(credentials):
         return False, f"Validation error: {str(e)}"
 
 
+def validate_azure_credentials(credentials):
+    """Validate Azure credentials by attempting to connect to storage"""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        connection_string = f"DefaultEndpointsProtocol=https;AccountName={credentials.get('account_name')};AccountKey={credentials.get('account_key')};EndpointSuffix=core.windows.net"
+        blob_service_client = BlobServiceClient.from_connection_string(
+            connection_string)
+        # Try to list containers
+        list(blob_service_client.list_containers(max_results=1))
+        return True, "Azure credentials are valid!"
+    except Exception as e:
+        return False, f"Validation error: {str(e)}"
+
+
 def apply_theme(theme_mode):
-    """Apply theme by modifying Streamlit config"""
-    STREAMLIT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    config_content = f"""[theme]
+    """Apply theme by modifying Streamlit config and page config"""
+    try:
+        # Read existing config if it exists
+        existing_config = ""
+        if STREAMLIT_CONFIG_FILE.exists():
+            with open(STREAMLIT_CONFIG_FILE, 'r') as f:
+                existing_config = f.read()
+
+        # Update or add theme section
+        theme_config = f"""
+[theme]
 base = "{theme_mode}"
+primaryColor = "#FF4B4B"
 """
-    with open(STREAMLIT_CONFIG_FILE, 'w') as f:
-        f.write(config_content)
 
+        # Remove old theme section if exists
+        if '[theme]' in existing_config:
+            lines = existing_config.split('\n')
+            new_lines = []
+            skip = False
+            for line in lines:
+                if line.strip().startswith('[theme]'):
+                    skip = True
+                    continue
+                elif line.strip().startswith('[') and skip:
+                    skip = False
+                if not skip:
+                    new_lines.append(line)
+            existing_config = '\n'.join(new_lines)
 
-# --- SPARK ARCHITECTURE ---
-# Spark uses a Master-Worker architecture. Even on a local machine, 
-# it manages memory through a Driver process and Executor threads.
+        # Write config
+        with open(STREAMLIT_CONFIG_FILE, 'w') as f:
+            f.write(existing_config + '\n' + theme_config)
+
+        return True
+    except Exception as e:
+        st.error(f"Error applying theme: {e}")
+        return False
+
 
 @st.cache_resource
 def get_spark_session(credentials):
     """
-    Creates and configures a SparkSession with AWS S3 credentials.
+    Creates and configures a SparkSession with cloud credentials.
     Uses st.cache_resource to ensure the SparkSession is created only once.
     """
-    builder = SparkSession.builder.appName(ui_cfg.get("app_title"))
+    builder = SparkSession.builder.appName(ui_cfg.get("app_title")) \
+        .config("spark.local.dir", os.path.join(os.getcwd(), TEMP_DATA_DIR, "spark"))
 
     if credentials:
-        # Configure Spark to use Hadoop S3a for S3 connectivity
-        # This requires specific Hadoop and AWS SDK JARs
-        builder = builder \
-            .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262") \
-            .config("spark.hadoop.fs.s3a.access.key", credentials.get('access_key', '')) \
-            .config("spark.hadoop.fs.s3a.secret.key", credentials.get('secret_key', '')) \
-            .config("spark.hadoop.fs.s3a.session.token", credentials.get('session_token', '')) \
-            .config("spark.hadoop.fs.s3a.endpoint", "s3.amazonaws.com") \
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        if credentials.get('type') == 'aws':
+            builder = builder \
+                .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262") \
+                .config("spark.hadoop.fs.s3a.access.key", credentials.get('access_key', '')) \
+                .config("spark.hadoop.fs.s3a.secret.key", credentials.get('secret_key', '')) \
+                .config("spark.hadoop.fs.s3a.session.token", credentials.get('session_token', '')) \
+                .config("spark.hadoop.fs.s3a.endpoint", "s3.amazonaws.com") \
+                .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        elif credentials.get('type') == 'azure':
+            builder = builder \
+                .config("spark.jars.packages", "org.apache.hadoop:hadoop-azure:3.3.4,com.microsoft.azure:azure-storage:8.6.6") \
+                .config(f"spark.hadoop.fs.azure.account.key.{credentials.get('account_name')}.blob.core.windows.net", credentials.get('account_key', ''))
 
-    # Enable Spark UI and set its port
     return builder \
         .config("spark.ui.enabled", "true") \
         .config("spark.ui.port", "4040") \
@@ -370,13 +491,15 @@ def get_spark_session(credentials):
 
 
 def get_system_resources():
-    """Get detailed system memory and disk usage"""
+    """Get system memory and disk usage - Application usage vs Available"""
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
 
+    # Get Spark process memory
     process = psutil.Process(os.getpid())
     app_mem = process.memory_info().rss
 
+    # Calculate app disk usage (downloads + temp data)
     app_disk_usage = 0
     for folder in [DOWNLOADS_DIR, TEMP_DATA_DIR]:
         if os.path.exists(folder):
@@ -389,12 +512,14 @@ def get_system_resources():
                         pass
 
     return {
-        'total_mem': mem.total,
-        'used_mem': mem.used,
-        'app_mem': app_mem,
-        'total_disk': disk.total,
-        'used_disk': disk.used,
-        'app_disk': app_disk_usage,
+        'app_mem_gb': app_mem / (1024**3),
+        'mem_available_gb': mem.available / (1024**3),
+        'mem_total_gb': mem.total / (1024**3),
+        'mem_percent': (app_mem / mem.available) * 100 if mem.available > 0 else 0,
+        'app_disk_gb': app_disk_usage / (1024**3),
+        'disk_available_gb': disk.free / (1024**3),
+        'disk_total_gb': disk.total / (1024**3),
+        'disk_percent': (app_disk_usage / disk.free) * 100 if disk.free > 0 else 0,
     }
 
 
@@ -627,24 +752,30 @@ def show_openai_setup():
     st.title(ui_cfg.get("header_title"))
     st.markdown("### Enable AI-Powered Data Analysis")
 
+    # Add back button
+    if st.button("← Back to Main", key="back_from_openai"):
+        st.session_state['show_openai_setup'] = False
+        st.rerun()
+
     api_key_from_env = load_openai_key()
     if api_key_from_env:
-        st.success(f"✅ OpenAI API Key loaded from environment variable '{OPENAI_API_KEY_ENV_VAR}'.")
+        st.success(
+            f"✅ OpenAI API Key loaded from environment variable '{OPENAI_API_KEY_ENV_VAR}'.")
     else:
-        st.warning(f"Waiting for '{OPENAI_API_KEY_ENV_VAR}' environment variable to be set.")
+        st.warning(
+            f"Waiting for '{OPENAI_API_KEY_ENV_VAR}' environment variable to be set.")
 
     with st.expander("Enter/Update OpenAI API Key", expanded=not api_key_from_env):
         st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
-        
-        api_key = st.text_input("OpenAI API Key:", type="password", placeholder="sk-...")
+
+        api_key = st.text_input(
+            "OpenAI API Key:", type="password", placeholder="sk-...")
 
         if st.button("💾 Save to .env and Validate"):
             if api_key.strip():
                 with st.spinner("Validating and saving API key..."):
                     update_env_file(OPENAI_API_KEY_ENV_VAR, api_key)
-                    # Reload dotenv to get the new key
                     load_dotenv(override=True)
-                    # Re-validate
                     is_valid, message = validate_openai_key(api_key)
                     if is_valid:
                         st.session_state['openai_key'] = api_key
@@ -663,89 +794,221 @@ def show_openai_setup():
 
 
 def show_credentials_setup():
-    """Show AWS credentials setup interface, allowing user to paste or enter manually."""
-    st.title("🔐 AWS Credentials Setup")
-    
-    credentials = load_credentials()
-    if credentials:
-        st.success(f"✅ AWS Credentials loaded from environment variables.")
-    else:
-        st.warning(f"Waiting for AWS credentials environment variables to be set (e.g., {AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID).")
-    
-    with st.expander("Enter/Update AWS Credentials", expanded=not credentials):
-        st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
+    """Show Cloud credentials setup interface, allowing user to paste or enter manually."""
+    st.title("🔐 Cloud Credentials Setup")
 
-        input_method = st.radio("Choose input method:", ["Paste Credentials", "Enter Manually"])
+    # Add back button
+    if st.button("← Back to Main", key="back_from_creds"):
+        st.session_state['skip_credentials'] = True
+        st.rerun()
 
-        if input_method == "Paste Credentials":
-            credentials_text = st.text_area(
-                "Paste your AWS credentials here:",
-                height=200,
-                placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
+    # Cloud provider selection
+    cloud_provider = st.radio(
+        "Select Cloud Provider:", ["AWS", "Azure"], horizontal=True, key="cloud_provider_select")
+
+    if cloud_provider == "AWS":
+        credentials = load_credentials('aws')
+        if credentials:
+            st.success(f"✅ AWS Credentials loaded from environment variables.")
+        else:
+            st.warning(
+                f"Waiting for AWS credentials environment variables to be set (e.g., {AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID).")
+
+        with st.expander("Enter/Update AWS Credentials", expanded=not credentials):
+            st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
+
+            input_method = st.radio("Choose input method:", [
+                                    "Paste Credentials", "Enter Manually"], key="aws_input_method")
+
+            if input_method == "Paste Credentials":
+                credentials_text = st.text_area(
+                    "Paste your AWS credentials here:",
+                    height=200,
+                    placeholder="""export AWS_ACCESS_KEY_ID="ASIA..."
 export AWS_SECRET_ACCESS_KEY="..."
-export AWS_SESSION_TOKEN="..."  # Optional for temporary credentials"""
-            )
+export AWS_SESSION_TOKEN="..."  # Optional for temporary credentials""",
+                    key="aws_paste"
+                )
 
-            if st.button("💾 Save to .env and Validate"):
-                if credentials_text.strip():
-                    parsed_creds = parse_aws_credentials(credentials_text)
-                    if parsed_creds:
+                if st.button("💾 Save to .env and Validate", key="aws_paste_save"):
+                    if credentials_text.strip():
+                        parsed_creds = parse_aws_credentials(credentials_text)
+                        if parsed_creds:
+                            with st.spinner("Validating and saving credentials..."):
+                                update_env_file(
+                                    f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", parsed_creds['access_key'])
+                                update_env_file(
+                                    f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", parsed_creds['secret_key'])
+                                if 'session_token' in parsed_creds:
+                                    update_env_file(
+                                        f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", parsed_creds['session_token'])
+
+                                load_dotenv(override=True)
+
+                                is_valid, message = validate_s3_credentials(
+                                    parsed_creds)
+
+                                if is_valid:
+                                    parsed_creds['type'] = 'aws'
+                                    st.session_state['credentials'] = parsed_creds
+                                    st.session_state['credentials_validated'] = True
+                                    st.session_state['cloud_type'] = 'aws'
+                                    st.success(f"✅ {message}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {message}")
+                        else:
+                            st.error(
+                                "Could not parse credentials. Please check the format.")
+                    else:
+                        st.error("Please paste your credentials.")
+
+            else:
+                aws_access_key = st.text_input(
+                    "AWS Access Key ID:", placeholder="ASIA...", key="aws_access_key")
+                aws_secret_key = st.text_input(
+                    "AWS Secret Access Key:", type="password", key="aws_secret_key")
+                aws_session_token = st.text_input(
+                    "AWS Session Token (optional):", type="password", key="aws_session_token")
+
+                if st.button("💾 Save to .env and Validate", key="aws_manual_save"):
+                    if aws_access_key.strip() and aws_secret_key.strip():
+                        new_creds = {
+                            'access_key': aws_access_key,
+                            'secret_key': aws_secret_key,
+                            'session_token': aws_session_token if aws_session_token.strip() else None,
+                            'type': 'aws'
+                        }
+
                         with st.spinner("Validating and saving credentials..."):
-                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", parsed_creds['access_key'])
-                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", parsed_creds['secret_key'])
-                            if 'session_token' in parsed_creds:
-                                update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", parsed_creds['session_token'])
-                            
+                            update_env_file(
+                                f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", aws_access_key)
+                            update_env_file(
+                                f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", aws_secret_key)
+                            if aws_session_token.strip():
+                                update_env_file(
+                                    f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", aws_session_token)
+
                             load_dotenv(override=True)
-                            
-                            is_valid, message = validate_s3_credentials(parsed_creds)
-                            
+
+                            is_valid, message = validate_s3_credentials(
+                                new_creds)
+
                             if is_valid:
-                                st.session_state['credentials'] = parsed_creds
+                                st.session_state['credentials'] = new_creds
                                 st.session_state['credentials_validated'] = True
+                                st.session_state['cloud_type'] = 'aws'
                                 st.success(f"✅ {message}")
                                 st.rerun()
                             else:
                                 st.error(f"❌ {message}")
                     else:
-                        st.error("Could not parse credentials. Please check the format.")
-                else:
-                    st.error("Please paste your credentials.")
-        
-        else: # Enter Manually
-            aws_access_key = st.text_input("AWS Access Key ID:", placeholder="ASIA...")
-            aws_secret_key = st.text_input("AWS Secret Access Key:", type="password")
-            aws_session_token = st.text_input("AWS Session Token (optional):", type="password")
+                        st.error(
+                            "Please enter both AWS Access Key ID and Secret Access Key.")
 
-            if st.button("💾 Save to .env and Validate"):
-                if aws_access_key.strip() and aws_secret_key.strip():
-                    new_creds = {
-                        'access_key': aws_access_key,
-                        'secret_key': aws_secret_key,
-                        'session_token': aws_session_token if aws_session_token.strip() else None
-                    }
-                    
-                    with st.spinner("Validating and saving credentials..."):
-                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}ACCESS_KEY_ID", aws_access_key)
-                        update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SECRET_ACCESS_KEY", aws_secret_key)
-                        if aws_session_token.strip():
-                            update_env_file(f"{AWS_CREDENTIALS_ENV_PREFIX}SESSION_TOKEN", aws_session_token)
-                        
-                        load_dotenv(override=True)
-                        
-                        is_valid, message = validate_s3_credentials(new_creds)
-                        
-                        if is_valid:
-                            st.session_state['credentials'] = new_creds
-                            st.session_state['credentials_validated'] = True
-                            st.success(f"✅ {message}")
-                            st.rerun()
+    else:  # Azure
+        credentials = load_credentials('azure')
+        if credentials:
+            st.success(
+                f"✅ Azure Credentials loaded from environment variables.")
+        else:
+            st.warning(
+                f"Waiting for Azure credentials environment variables to be set (e.g., {AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_ACCOUNT).")
+
+        with st.expander("Enter/Update Azure Credentials", expanded=not credentials):
+            st.warning("⚠️ **Security Warning:** Saving credentials from the UI will write to a local `.env` file. It is more secure to set environment variables directly in your shell or operating system.")
+
+            input_method = st.radio("Choose input method:", [
+                                    "Paste Credentials", "Enter Manually"], key="azure_input_method")
+
+            if input_method == "Paste Credentials":
+                credentials_text = st.text_area(
+                    "Paste your Azure credentials here:",
+                    height=200,
+                    placeholder="""export AZURE_STORAGE_ACCOUNT="mystorageaccount"
+export AZURE_STORAGE_KEY="..."
+export AZURE_CONTAINER="mycontainer"  # Optional""",
+                    key="azure_paste"
+                )
+
+                if st.button("💾 Save to .env and Validate", key="azure_paste_save"):
+                    if credentials_text.strip():
+                        parsed_creds = parse_azure_credentials(
+                            credentials_text)
+                        if parsed_creds:
+                            with st.spinner("Validating and saving credentials..."):
+                                update_env_file(
+                                    f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_ACCOUNT", parsed_creds['account_name'])
+                                update_env_file(
+                                    f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_KEY", parsed_creds['account_key'])
+                                if 'container' in parsed_creds:
+                                    update_env_file(
+                                        f"{AZURE_CREDENTIALS_ENV_PREFIX}CONTAINER", parsed_creds['container'])
+
+                                load_dotenv(override=True)
+
+                                is_valid, message = validate_azure_credentials(
+                                    parsed_creds)
+
+                                if is_valid:
+                                    parsed_creds['type'] = 'azure'
+                                    st.session_state['credentials'] = parsed_creds
+                                    st.session_state['credentials_validated'] = True
+                                    st.session_state['cloud_type'] = 'azure'
+                                    st.success(f"✅ {message}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {message}")
                         else:
-                            st.error(f"❌ {message}")
-                else:
-                    st.error("Please enter both AWS Access Key ID and Secret Access Key.")
+                            st.error(
+                                "Could not parse credentials. Please check the format.")
+                    else:
+                        st.error("Please paste your credentials.")
 
-    if st.button("⏭️ Skip (Local Files Only)", key="skip_aws_setup"):
+            else:
+                azure_account_name = st.text_input(
+                    "Azure Storage Account Name:", placeholder="mystorageaccount", key="azure_account")
+                azure_account_key = st.text_input(
+                    "Azure Storage Key:", type="password", key="azure_key")
+                azure_container = st.text_input(
+                    "Azure Container (optional):", placeholder="mycontainer", key="azure_container")
+
+                if st.button("💾 Save to .env and Validate", key="azure_manual_save"):
+                    if azure_account_name.strip() and azure_account_key.strip():
+                        new_creds = {
+                            'account_name': azure_account_name,
+                            'account_key': azure_account_key,
+                            'container': azure_container if azure_container.strip() else None,
+                            'type': 'azure'
+                        }
+
+                        with st.spinner("Validating and saving credentials..."):
+                            update_env_file(
+                                f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_ACCOUNT", azure_account_name)
+                            update_env_file(
+                                f"{AZURE_CREDENTIALS_ENV_PREFIX}STORAGE_KEY", azure_account_key)
+                            if azure_container.strip():
+                                update_env_file(
+                                    f"{AZURE_CREDENTIALS_ENV_PREFIX}CONTAINER", azure_container)
+
+                            load_dotenv(override=True)
+
+                            is_valid, message = validate_azure_credentials(
+                                new_creds)
+
+                            if is_valid:
+                                st.session_state['credentials'] = new_creds
+                                st.session_state['credentials_validated'] = True
+                                st.session_state['cloud_type'] = 'azure'
+                                st.success(f"✅ {message}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+                    else:
+                        st.error(
+                            "Please enter both Azure Storage Account Name and Key.")
+
+    if st.button("⏭️ Skip (Local Files Only)", key="skip_cloud_setup"):
         st.session_state['credentials'] = None
         st.session_state['credentials_validated'] = False
         st.session_state['skip_credentials'] = True
@@ -781,7 +1044,8 @@ def _display_conversation_entry(conv_num, conv_entry):
                 st.markdown("**A:**")
                 st.markdown(conv_entry['response'])
             else:
-                response_preview = conv_entry['response'][:300] + "..." if len(conv_entry['response']) > 300 else conv_entry['response']
+                response_preview = conv_entry['response'][:300] + "..." if len(
+                    conv_entry['response']) > 300 else conv_entry['response']
                 st.markdown(f"**A:** {response_preview}")
         elif 'query' in conv_entry:
             st.code(conv_entry['query'], language="sql")
@@ -789,7 +1053,8 @@ def _display_conversation_entry(conv_num, conv_entry):
                 st.markdown("**Analysis:**")
                 st.markdown(conv_entry['analysis'])
             else:
-                analysis_preview = conv_entry['analysis'][:300] + "..." if len(conv_entry['analysis']) > 300 else conv_entry['analysis']
+                analysis_preview = conv_entry['analysis'][:300] + "..." if len(
+                    conv_entry['analysis']) > 300 else conv_entry['analysis']
                 st.markdown(f"**Analysis:** {analysis_preview}")
         elif 'type' in conv_entry and conv_entry['type'] == 'sql_analysis':
             st.code(conv_entry['query'], language="sql")
@@ -797,10 +1062,27 @@ def _display_conversation_entry(conv_num, conv_entry):
                 st.markdown("**Full Analysis:**")
                 st.markdown(conv_entry['analysis'])
             else:
-                analysis_preview = conv_entry['analysis'][:300] + "..." if len(conv_entry['analysis']) > 300 else conv_entry['analysis']
+                analysis_preview = conv_entry['analysis'][:300] + "..." if len(
+                    conv_entry['analysis']) > 300 else conv_entry['analysis']
                 st.markdown(f"**Analysis:** {analysis_preview}")
 
         st.markdown("---")
+
+
+def dataframe_to_csv_string(df):
+    """Convert Spark DataFrame to CSV string without using pandas"""
+    rows = df.collect()
+    columns = df.columns
+
+    # Create CSV header
+    csv_lines = [",".join(columns)]
+
+    # Add data rows
+    for row in rows:
+        csv_lines.append(
+            ",".join([str(val) if val is not None else "" for val in row]))
+
+    return "\n".join(csv_lines)
 
 
 def main():
@@ -818,7 +1100,12 @@ def main():
     if 'metadata_cache' not in st.session_state:
         st.session_state['metadata_cache'] = load_metadata()
     if 'credentials' not in st.session_state:
-        st.session_state['credentials'] = load_credentials()
+        # Try to load from both AWS and Azure
+        aws_creds = load_credentials('aws')
+        azure_creds = load_credentials('azure')
+        st.session_state['credentials'] = aws_creds or azure_creds
+        st.session_state['cloud_type'] = 'aws' if aws_creds else (
+            'azure' if azure_creds else None)
     if 'credentials_validated' not in st.session_state:
         st.session_state['credentials_validated'] = st.session_state['credentials'] is not None
     if 'openai_key' not in st.session_state:
@@ -827,9 +1114,11 @@ def main():
         st.session_state['ai_conversation'] = []
     if 'show_openai_setup' not in st.session_state:
         st.session_state['show_openai_setup'] = False
+    if 'staged_query' not in st.session_state:
+        st.session_state['staged_query'] = None
 
     # Check if OpenAI setup is requested
-    if st.session_state.get('show_openai_setup', False) and not st.session_state['openai_key']:
+    if st.session_state.get('show_openai_setup', False):
         show_openai_setup()
         return
 
@@ -838,46 +1127,25 @@ def main():
         show_credentials_setup()
         return
 
-    # Sidebar
+    # Sidebar - Redesigned
     with st.sidebar:
-        st.header(ui_cfg.get("sidebar_header"))
-
-        # Theme toggle
-        current_theme = st.session_state.get('theme', 'light')
-        theme_label = "🌙 Dark" if current_theme == 'light' else "☀️ Light"
-        if st.button(theme_label, use_container_width=True):
-            new_theme = 'dark' if current_theme == 'light' else 'light'
-            st.session_state['theme'] = new_theme
-            apply_theme(new_theme)
-            st.rerun()
-
-        # Credentials status
-        if st.session_state['credentials']:
-            st.success("✅ AWS: Connected")
-            if st.button("🔄 Update Credentials", use_container_width=True):
-                st.session_state['credentials'] = None
-                st.session_state['credentials_validated'] = False
-                st.rerun()
-        else:
-            st.warning("⚠️ AWS: Not configured (Local only)")
-            if st.button("🔐 Setup AWS", use_container_width=True):
-                st.session_state['credentials'] = None
-                st.rerun()
-
-        # OpenAI status
-        if st.session_state['openai_key']:
-            st.success("✅ AI: Enabled")
-            if st.button("🔄 Update OpenAI Key", use_container_width=True):
-                st.session_state['openai_key'] = None
-                st.session_state['show_openai_setup'] = True
-                st.rerun()
-        else:
-            st.warning("⚠️ AI: Disabled")
-            if st.button("🤖 Setup OpenAI", use_container_width=True):
-                st.session_state['show_openai_setup'] = True
-                st.rerun()
-
-        st.markdown("---")
+        # Active Tables at Top
+        if st.session_state['tables']:
+            st.markdown("### 📊 Active Tables")
+            for name, info in st.session_state['tables'].items():
+                with st.expander(f"✅ {name}", expanded=False):
+                    st.write(f"**Rows:** {info['row_count']:,}")
+                    st.write(f"**Cols:** {info['col_count']}")
+                    st.write(f"**Source:** {info['source']}")
+                    if st.button(f"🗑️ Unload", key=f"unload_{name}", use_container_width=True):
+                        del st.session_state['tables'][name]
+                        try:
+                            get_spark_session(
+                                st.session_state['credentials']).catalog.dropTempView(name)
+                        except:
+                            pass
+                        st.rerun()
+            st.markdown("---")
 
         # Saved Tables Management
         st.markdown("### 📂 Saved Tables")
@@ -898,9 +1166,9 @@ def main():
                     status = "Cached"
                 else:
                     status_icon = "☁️"
-                    status = "S3 Only"
+                    status = "Cloud Only"
 
-                with st.expander(f"{status_icon} {table_name} ({status})"):
+                with st.expander(f"{status_icon} {table_name} ({status})", expanded=False):
                     st.write(f"**Source:** {meta.get('source', 'Unknown')}")
                     st.write(f"**Rows:** {meta.get('row_count', 0):,}")
                     st.write(f"**Columns:** {meta.get('col_count', 0)}")
@@ -925,7 +1193,7 @@ def main():
                                             st.error(f"Error: {msg}")
                                 else:
                                     st.error(
-                                        "AWS credentials required for S3 tables")
+                                        "Cloud credentials required for cloud tables")
                         else:
                             st.success("✅ Loaded")
 
@@ -951,25 +1219,7 @@ def main():
 
         st.markdown("---")
 
-        # Active Tables Management
-        if st.session_state['tables']:
-            st.markdown("### 📊 Active Tables")
-            for name, info in st.session_state['tables'].items():
-                with st.expander(f"✅ {name}"):
-                    st.write(f"**Rows:** {info['row_count']:,}")
-                    st.write(f"**Cols:** {info['col_count']}")
-                    st.write(f"**Source:** {info['source']}")
-                    if st.button(f"🗑️ Unload", key=f"unload_{name}", use_container_width=True):
-                        del st.session_state['tables'][name]
-                        try:
-                            get_spark_session(
-                                st.session_state['credentials']).catalog.dropTempView(name)
-                        except:
-                            pass
-                        st.rerun()
-
-        st.markdown("---")
-
+        # Action buttons
         if st.button("💾 Save Metadata", use_container_width=True):
             if save_metadata():
                 st.session_state['metadata_cache'] = load_metadata()
@@ -979,7 +1229,6 @@ def main():
             st.session_state['tables'] = {}
             st.rerun()
 
-        st.markdown("---")
         if st.button("🗑️ Clear Temporary Files", use_container_width=True):
             try:
                 shutil.rmtree(TEMP_DATA_DIR)
@@ -988,507 +1237,358 @@ def main():
             except Exception as e:
                 st.error(f"Error clearing temporary files: {e}")
 
-    # Main area
+        # Fixed icons at bottom with custom CSS for tight spacing
+        st.markdown("---")
+        st.markdown("""
+            <style>
+            div[data-testid="stHorizontalBlock"] > div {
+                padding: 0px !important;
+                margin: 0px !important;
+            }
+            div[data-testid="stHorizontalBlock"] button {
+                padding: 0.25rem !important;
+                margin: 0px !important;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            current_theme = st.session_state.get('theme', 'light')
+            theme_icon = "🌙" if current_theme == 'light' else "☀️"
+            if st.button(theme_icon, help="Toggle theme", use_container_width=True, key="theme_toggle"):
+                new_theme = 'dark' if current_theme == 'light' else 'light'
+                st.session_state['theme'] = new_theme
+                if apply_theme(new_theme):
+                    st.info(
+                        "Theme preference saved! Please refresh the page (F5) to see the changes.")
+
+        with col2:
+            # Cloud status icon
+            cloud_type = st.session_state.get('cloud_type', None)
+            if st.session_state['credentials']:
+                cloud_icon = "☁️✅" if cloud_type == 'aws' else "🔵✅"
+                if cloud_type:
+                    cloud_help = f"{cloud_type.upper()} Connected"
+            else:
+                cloud_icon = "☁️❌"
+                cloud_help = "Not Connected"
+
+            if st.button(cloud_icon, help=cloud_help, use_container_width=True, key="cloud_toggle"):
+                if st.session_state['credentials']:
+                    st.session_state['credentials'] = None
+                    st.session_state['credentials_validated'] = False
+                    st.session_state['cloud_type'] = None
+                    if 'skip_credentials' in st.session_state:
+                        del st.session_state['skip_credentials']
+                    st.rerun()
+                else:
+                    if 'skip_credentials' in st.session_state:
+                        del st.session_state['skip_credentials']
+                    st.rerun()
+
+        with col3:
+            # AI status icon
+            ai_icon = "🤖✅" if st.session_state['openai_key'] else "🤖❌"
+            ai_help = "AI Enabled" if st.session_state['openai_key'] else "AI Disabled"
+
+            if st.button(ai_icon, help=ai_help, use_container_width=True, key="ai_toggle"):
+                if st.session_state['openai_key']:
+                    st.session_state['openai_key'] = None
+                st.session_state['show_openai_setup'] = True
+                st.rerun()
+
+        with col4:
+            # System resources icon - App Used vs Available
+            resources = get_system_resources()
+            mem_used_pct = resources['mem_percent']
+
+            # Use colors based on usage
+            if mem_used_pct < 50:
+                resource_icon = "💾🟢"
+            elif mem_used_pct < 80:
+                resource_icon = "💾🟡"
+            else:
+                resource_icon = "💾🔴"
+
+            resource_help = f"App Memory: {resources['app_mem_gb']:.1f}GB / {resources['mem_available_gb']:.1f}GB available\nApp Disk: {resources['app_disk_gb']:.1f}GB / {resources['disk_available_gb']:.1f}GB available"
+
+            st.button(
+                resource_icon,
+                help=resource_help,
+                disabled=True,
+                use_container_width=True,
+                key="resources_display"
+            )
+
+    # Main area - rest of the code continues from original
+    # (SQL Query section, AI Analysis section, Load Data section remain the same)
     st.title("🔍 S3 Spark SQL Query Tool")
 
-    with st.expander("💻 System Resources", expanded=True):
-        # Create placeholders for the metrics
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**📊 Memory (RAM)**")
-            mem_bar = st.progress(0)
-            mem_text = st.caption("")
-        with col2:
-            st.markdown("**💾 Disk Storage**")
-            disk_bar = st.progress(0)
-            disk_text = st.caption("")
+    # --- LOAD DATA SECTION ---
+    with st.expander("📂 Load Data", expanded=not st.session_state['tables']):
+        load_method = st.radio("Load from:", ("S3", "Local"), horizontal=True)
 
-        # Live update loop
-        while True:
-            resources = get_system_resources()
-            
-            mem_pct = (resources['used_mem'] / resources['total_mem']) * 100
-            mem_bar.progress(int(mem_pct))
-            mem_text.caption(
-                f"Used: {format_bytes(resources['used_mem'])} / {format_bytes(resources['total_mem'])} ({mem_pct:.1f}%) | "
-                f"App: {format_bytes(resources['app_mem'])}"
-            )
+        if load_method == "S3":
+            if not st.session_state['credentials']:
+                st.warning(
+                    "S3 credentials not set. Please configure them in the sidebar.")
+            else:
+                s3_path = st.text_input("S3 Path (s3://bucket/path):")
+                file_format = st.selectbox("File Format:", ["parquet", "csv"])
+                table_name = st.text_input(
+                    "Table Name:", f"tbl_{int(time.time())}")
 
-            disk_pct = (resources['used_disk'] / resources['total_disk']) * 100
-            disk_bar.progress(int(disk_pct))
-            disk_text.caption(
-                f"Used: {format_bytes(resources['used_disk'])} / {format_bytes(resources['total_disk'])} ({disk_pct:.1f}%) | "
-                f"App: {format_bytes(resources['app_disk'])}"
-            )
-            time.sleep(1)
+                csv_options = {}
+                if file_format == 'csv':
+                    with st.container():
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            csv_options['header'] = st.toggle(
+                                "Header", value=True)
+                            csv_options['inferSchema'] = st.toggle(
+                                "Infer Schema", value=True)
+                        with col2:
+                            csv_options['sep'] = st.text_input(
+                                "Delimiter:", ",")
 
-    # AI Analysis Section (if OpenAI is set up and tables exist)
-    if st.session_state['openai_key'] and st.session_state['tables']:
-        st.subheader(ui_cfg.get("ai_section_title"))
+                load_mode = st.radio("Load Mode:", [
+                                     "Direct (for large datasets, slower queries)", "Download (for smaller datasets, faster queries)"], horizontal=True)
 
-        selected_table = st.selectbox(
-            "Select table for AI analysis:",
-            options=list(st.session_state['tables'].keys()),
-            key="ai_table_select"
-        )
-
-        user_question = st.text_area(
-            "Ask a question about your data:",
-            placeholder="Examples:\n- What are the top 10 customers by revenue?\n- Show me sales trends over time\n- Find anomalies in the data\n- What's the average transaction value by region?",
-            height=100,
-            key="ai_question"
-        )
-
-        col1, col2, col3 = st.columns([1, 1, 3])
-        with col1:
-            analyze_button = st.button("🔍 Analyze", type="primary")
-        with col2:
-            if st.button("🗑️ Clear Conversation"):
-                st.session_state['ai_conversation'] = []
-                st.rerun()
-
-        if analyze_button and user_question.strip():
-            with st.spinner("🤔 AI is analyzing your data..."):
-                response_generator = analyze_data_with_ai(
-                    selected_table,
-                    user_question,
-                    st.session_state['credentials'],
-                    st.session_state['openai_key'],
-                    stream=True
-                )
-
-                response_placeholder = st.empty()
-                full_response = ""
-
-                for chunk in response_generator:
-                    if hasattr(chunk, 'choices') and chunk.choices[0].delta.content:
-                        full_response += chunk.choices[0].delta.content
-                        response_placeholder.markdown(full_response + "▌")
-                    elif isinstance(chunk, dict) and "error" in chunk: # Handle error from streamed response
-                        st.error(f"Error during AI analysis: {chunk['error']}")
-                        full_response = f"Error during AI analysis: {chunk['error']}"
-                        break # Stop processing chunks if an error occurs
-
-                response_placeholder.markdown(full_response)
-
-                # Store in conversation
-                st.session_state['ai_conversation'].append({
-                    'question': user_question,
-                    'response': full_response,
-                    'table': selected_table
-                })
-
-                # Check if response contains SQL query
-                sql_match = re.search(
-                    r'```sql\n(.*?)\n```', full_response, re.DOTALL)
-
-                if sql_match:
-                    suggested_query = sql_match.group(1).strip()
-                    st.info("💡 AI suggested a SQL query to get more insights!")
-                    st.code(suggested_query, language="sql")
-
-                    if st.button("▶️ Run Suggested Query", key="run_ai_query"):
-                        try:
-                            with st.spinner("Executing query..."):
-                                success, result_str, row_count = execute_query_for_ai(
-                                    suggested_query,
-                                    st.session_state['credentials']
-                                )
-
+                if st.button("🚀 Load Table"):
+                    if s3_path and table_name:
+                        with st.spinner(f"Loading {table_name} from S3..."):
+                            if load_mode == "Download":
+                                success, msg, local_files, total_size, local_path = download_from_s3_with_progress(
+                                    s3_path, file_format, table_name, st.session_state['credentials'])
                                 if success:
-                                    st.success(
-                                        f"✅ Query executed! Returned {row_count} rows")
-
-                                    # Show results
-                                    spark = get_spark_session(
-                                        st.session_state['credentials'])
-                                    result_df = spark.sql(suggested_query)
-                                    pdf = result_df.limit(100).toPandas()
-                                    st.dataframe(pdf, use_container_width=True)
-
-                                    # Get AI analysis of results
-                                    with st.spinner("🤔 AI is analyzing the results..."):
-                                        follow_up = analyze_with_query_results(
-                                            selected_table,
-                                            user_question,
-                                            result_str,
-                                            st.session_state['credentials'],
-                                            st.session_state['openai_key']
-                                        )
-
-                                        st.markdown("### 📊 Analysis:")
-                                        st.markdown(follow_up)
-
-                                        # Store follow-up in conversation
-                                        st.session_state['ai_conversation'].append({
-                                            'query': suggested_query,
-                                            'results': result_str,
-                                            'analysis': follow_up,
-                                            'table': selected_table
-                                        })
+                                    success, df, error = load_from_local_files(
+                                        local_files, file_format, csv_options, st.session_state['credentials'])
+                                    source_info = f"S3 (Downloaded to {local_path})"
                                 else:
-                                    st.error(f"Query failed: {result_str}")
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
+                                    st.error(msg)
+                                    st.stop()
+                            else:  # Direct load
+                                success, df, error = load_from_s3_direct(
+                                    s3_path, file_format, csv_options, st.session_state['credentials'])
+                                source_info = f"S3 Direct ({s3_path})"
+                                local_files = []
+                                total_size = 0  # Can't easily get total size for direct load
 
-        # Show conversation history
-        if st.session_state['ai_conversation']:
-            with st.expander("📜 Conversation History", expanded=False):
-                for idx, conv in enumerate(reversed(st.session_state['ai_conversation']), 1):
-                    conv_num = len(st.session_state['ai_conversation']) - idx + 1
-                    _display_conversation_entry(conv_num, conv)
-
-        st.markdown("---")
-
-    # Check if OpenAI needs setup
-    elif not st.session_state['openai_key'] and st.session_state['tables']:
-        with st.expander("🤖 Enable AI Analysis", expanded=False):
-            show_openai_setup()
-
-    # SQL Query section
-    if st.session_state['tables']:
-        st.subheader("🔍 SQL Query")
-
-        tables_list = list(st.session_state['tables'].keys())
-
-        with st.expander("📋 Available Tables & Columns", expanded=False):
-            for table_name in tables_list:
-                st.markdown(f"**{table_name}:**")
-                cols = st.session_state['tables'][table_name].get(
-                    'columns', [])
-                st.code(", ".join(cols), language="text")
-
-        default_query = f"SELECT * FROM {tables_list[0]} LIMIT 100" if tables_list else ""
-        query = st.text_area("Enter SQL query:",
-                             value=default_query, height=150)
-
-        if st.button("▶️ Execute Query", type="primary"):
-            start_time = time.time()
-            with st.spinner("Executing query..."):
-                spark = get_spark_session(st.session_state['credentials'])
-                result = spark.sql(query)
-
-                pdf = result.toPandas()
-                execution_time = time.time() - start_time
-
-                data_scanned = sum([st.session_state['tables'][t].get('size_bytes', 0)
-                                   for t in tables_list if t in query])
-
-                # Store results in session state for AI analysis
-                st.session_state['last_query_results'] = {
-                    'query': query,
-                    'dataframe': pdf,
-                    'execution_time': execution_time,
-                    'data_scanned': data_scanned,
-                    'execution_plan': result._jdf.queryExecution().simpleString()
-                }
-                st.rerun()
-
-        # Display results if available
-        if st.session_state.get('last_query_results'):
-            last_results = st.session_state['last_query_results']
-            pdf = last_results['dataframe']
-            execution_time = last_results['execution_time']
-            data_scanned = last_results['data_scanned']
-
-            with st.expander("🔍 Query Execution Plan"):
-                st.text(last_results['execution_plan'])
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Rows Returned", f"{len(pdf):,}")
-            with col2:
-                st.metric("Execution Time", f"{execution_time:.2f}s")
-            with col3:
-                st.metric("Data Scanned (approx)", format_bytes(data_scanned))
-
-            st.dataframe(pdf, use_container_width=True)
-
-            csv = pdf.to_csv(index=False)
-
-            # AI Analysis of Query Results (only show if AI is enabled)
-            if st.session_state.get('openai_key'):
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    st.download_button("📥 Download CSV", csv,
-                                       f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                       key="download_csv_main")
-                with col2:
-                    if st.button("🤖 Analyze Results with AI", key="analyze_sql_results"):
-                        st.session_state['trigger_ai_analysis'] = True
-                        st.rerun()
-            else:
-                st.download_button("📥 Download CSV", csv,
-                                   f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                   key="download_csv_main")
-
-        # Show AI analysis if triggered
-        if st.session_state.get('trigger_ai_analysis', False) and st.session_state.get('last_query_results'):
-            st.session_state['trigger_ai_analysis'] = False
-
-            last_results = st.session_state['last_query_results']
-            pdf = last_results['dataframe']
-            query = last_results['query']
-
-            st.markdown("---")
-
-            with st.spinner("🤔 AI is analyzing the query results..."):
-                # Prepare results for AI
-                result_summary = f"""
-Query executed: {query}
-
-Results Summary:
-- Rows returned: {len(pdf):,}
-- Execution time: {last_results['execution_time']:.2f}s
-
-Sample of results (first 20 rows):
-{pdf.head(20).to_string()}
-
-Full statistics:
-{pdf.describe().to_string() if len(pdf.describe().columns) > 0 else 'No numeric columns'}
-"""
-
-                # Get AI analysis
-                try:
-                    client = OpenAI(api_key=st.session_state['openai_key'])
-
-                    response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": "You are a data analyst expert. Analyze the SQL query results and provide insights."},
-                            {"role": "user", "content": f"""Analyze these query results and provide:
-
-{result_summary}
-
-Please provide:
-1. **Key Findings**: What are the main insights from this data?
-2. **Patterns & Trends**: Any notable patterns, trends, or anomalies?
-3. **Data Quality**: Any concerns about data quality or completeness?
-4. **Recommendations**: What actions or further analysis would you recommend?
-5. **Follow-up Questions**: Suggest 2-3 follow-up queries that would provide additional insights.
-
-Format your response with clear sections using markdown."""}
-                        ],
-                        temperature=0.7,
-                        max_tokens=2000
-                    )
-
-                    analysis = response.choices[0].message.content
-
-                    st.markdown("---")
-                    st.markdown("### 🤖 AI Analysis of Query Results")
-                    st.markdown(analysis)
-
-                    # Store in conversation
-                    st.session_state['ai_conversation'].append({
-                        'type': 'sql_analysis',
-                        'query': query,
-                        'results_summary': result_summary,
-                        'analysis': analysis,
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-                except Exception as e:
-                    st.error(f"Error analyzing results: {str(e)}")
-
-        st.markdown("---")
-
-    # Load data section
-    st.subheader("📥 Load Data")
-
-    source = st.radio("Data Source:", ["S3", "Local Files"], horizontal=True)
-
-    # Disable S3 if no credentials
-    if source == "S3" and not st.session_state.get('credentials'):
-        st.warning(
-            "⚠️ AWS credentials required for S3 features. Click 'Setup AWS' in sidebar.")
-        source = "Local Files"
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        table_name = st.text_input("Table Name:", placeholder="my_table")
-    with col2:
-        file_format = st.selectbox("Format:", ["parquet", "csv"])
-
-    csv_options = {}
-    if file_format == "csv":
-        with st.expander("CSV Options"):
-            col1, col2 = st.columns(2)
-            with col1:
-                csv_options['header'] = st.checkbox("Header", value=True)
-            with col2:
-                csv_options['inferSchema'] = st.checkbox(
-                    "Infer Schema", value=True)
-
-    if source == "S3":
-        s3_path = st.text_input("S3 Path:", placeholder="s3://bucket/path/")
-        load_method = st.radio("Load Method:", [
-                               "Direct Load (Faster)", "Download and Cache Locally"], horizontal=True)
-
-        if st.button("📥 Load from S3", type="primary"):
-            if not s3_path or not table_name:
-                st.error("Enter both S3 path and table name")
-            elif table_name in st.session_state['tables']:
-                st.error(f"Table '{table_name}' already loaded")
-            else:
-                if load_method == "Direct Load (Faster)":
-                    with st.spinner("Loading directly from S3..."):
-                        success, df, error = load_from_s3_direct(
-                            s3_path, file_format, csv_options, st.session_state['credentials'])
-                        if success:
-                            df.cache()
-                            df.createOrReplaceTempView(table_name)
-
-                            st.session_state['tables'][table_name] = {
-                                'dataframe': df,
-                                'temp_dir': None,
-                                'file_count': 1,
-                                'row_count': df.count(),
-                                'col_count': len(df.columns),
-                                'source': f'S3: {s3_path}',
-                                'size_bytes': 0,
-                                'columns': df.columns,
-                                'schema': [{'name': f.name, 'type': str(f.dataType)} for f in df.schema.fields],
-                                'created_at': datetime.now().isoformat(),
-                                's3_path': s3_path,
-                                'file_format': file_format,
-                                'csv_options': csv_options,
-                                'loaded': True,
-                                'local_files': [],
-                                'local_path': ''
-                            }
-
-                            save_metadata()
-                            st.session_state['metadata_cache'] = load_metadata(
-                            )
-                            st.success(f"✅ Loaded {table_name}!")
-                            st.dataframe(df.limit(10).toPandas(),
-                                         use_container_width=True)
-                            st.rerun()
-                        else:
-                            st.error(f"Error: {error}")
-                else:
-                    success, message, files, total_size, local_path = download_from_s3_with_progress(
-                        s3_path, file_format, table_name, st.session_state['credentials'])
-
-                    if success:
-                        with st.spinner("Loading into Spark..."):
-                            spark_success, df, error = load_from_local_files(
-                                files, file_format, csv_options, st.session_state['credentials'])
-
-                            if spark_success:
-                                df.cache()
+                            if success:
                                 df.createOrReplaceTempView(table_name)
-
                                 st.session_state['tables'][table_name] = {
                                     'dataframe': df,
-                                    'temp_dir': None,
-                                    'file_count': len(files),
-                                    'row_count': df.count(),
-                                    'col_count': len(df.columns),
-                                    'source': f'S3: {s3_path}',
-                                    'size_bytes': total_size,
-                                    'columns': df.columns,
-                                    'schema': [{'name': f.name, 'type': str(f.dataType)} for f in df.schema.fields],
-                                    'created_at': datetime.now().isoformat(),
+                                    'source': source_info,
                                     's3_path': s3_path,
                                     'file_format': file_format,
-                                    'csv_options': csv_options,
-                                    'loaded': True,
-                                    'local_files': files,
-                                    'local_path': local_path
+                                    'csv_options': csv_options if file_format == 'csv' else {},
+                                    'local_files': local_files,
+                                    'local_path': os.path.dirname(local_files[0]) if local_files else None,
+                                    'size_bytes': total_size,
+                                    'row_count': df.count(),
+                                    'col_count': len(df.columns),
+                                    'schema': [{'name': f.name, 'type': str(f.dataType)} for f in df.schema.fields],
+                                    'loaded': True
                                 }
-
                                 save_metadata()
-                                st.session_state['metadata_cache'] = load_metadata(
-                                )
                                 st.success(
-                                    f"✅ Loaded {table_name}! Cached locally: {format_bytes(total_size)}")
-                                st.dataframe(df.limit(10).toPandas(),
-                                             use_container_width=True)
+                                    f"Table '{table_name}' loaded successfully!")
                                 st.rerun()
                             else:
-                                st.error(f"Error loading into Spark: {error}")
+                                st.error(f"Error loading table: {error}")
                     else:
-                        st.error(message)
+                        st.error("Please provide S3 path and table name.")
 
-    else:  # Local files
-        uploaded = st.file_uploader(
-            f"Upload {file_format.upper()} files:",
-            type=['parquet', 'parq'] if file_format == 'parquet' else [
-                'csv', 'txt'],
-            accept_multiple_files=True
-        )
+        elif load_method == "Local":
+            st.info("Local mode uses files already downloaded or available locally.")
+            local_path = st.text_input("Local Folder Path:", DOWNLOADS_DIR)
+            file_format = st.selectbox(
+                "File Format:", ["parquet", "csv"], key="local_format")
+            table_name = st.text_input(
+                "Table Name:", f"tbl_local_{int(time.time())}")
 
-        if st.button("📥 Load Local Files", type="primary") and uploaded:
-            if not table_name:
-                st.error("Enter table name")
-            elif table_name in st.session_state['tables']:
-                st.error(f"Table '{table_name}' already loaded")
-            else:
-                try:
-                    temp_dir = tempfile.mkdtemp(dir=TEMP_DATA_DIR)
-                    files = []
-                    total_size = 0
+            csv_options = {}
+            if file_format == 'csv':
+                with st.container():
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        csv_options['header'] = st.toggle(
+                            "Header", value=True, key="local_header")
+                        csv_options['inferSchema'] = st.toggle(
+                            "Infer Schema", value=True, key="local_infer")
+                    with col2:
+                        csv_options['sep'] = st.text_input(
+                            "Delimiter:", ",", key="local_sep")
 
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+            if st.button("🚀 Load Local Table"):
+                if local_path and table_name:
+                    if os.path.exists(local_path) and os.path.isdir(local_path):
+                        with st.spinner(f"Loading {table_name} from {local_path}..."):
+                            local_files = [os.path.join(local_path, f) for f in os.listdir(
+                                local_path) if not f.startswith('.')]
+                            if not local_files:
+                                st.error(f"No files found in {local_path}")
+                                st.stop()
 
-                    for idx, f in enumerate(uploaded, 1):
-                        path = os.path.join(temp_dir, f.name)
-                        with open(path, 'wb') as out:
-                            out.write(f.getbuffer())
-                        files.append(path)
-                        total_size += f.size
+                            success, df, error = load_from_local_files(
+                                local_files, file_format, csv_options, st.session_state['credentials'])
 
-                        progress_bar.progress(idx / len(uploaded))
-                        status_text.text(
-                            f"Uploading: {format_bytes(total_size)} ({idx}/{len(uploaded)} files)")
+                            if success:
+                                total_size = sum(os.path.getsize(f) for f in local_files)
+                                df.createOrReplaceTempView(table_name)
+                                st.session_state['tables'][table_name] = {
+                                    'dataframe': df,
+                                    'source': f"Local ({local_path})",
+                                    's3_path': None,
+                                    'file_format': file_format,
+                                    'csv_options': csv_options if file_format == 'csv' else {},
+                                    'local_files': local_files,
+                                    'local_path': local_path,
+                                    'size_bytes': total_size,
+                                    'row_count': df.count(),
+                                    'col_count': len(df.columns),
+                                    'schema': [{'name': f.name, 'type': str(f.dataType)} for f in df.schema.fields],
+                                    'loaded': True
+                                }
+                                save_metadata()
+                                st.success(
+                                    f"Table '{table_name}' loaded successfully from local files!")
+                                st.rerun()
+                            else:
+                                st.error(
+                                    f"Error loading local table: {error}")
+                    else:
+                        st.error(f"Local path '{local_path}' does not exist or is not a directory.")
+                else:
+                    st.error("Please provide a local path and table name.")
 
-                    progress_bar.empty()
-                    status_text.empty()
+    # --- SQL QUERY SECTION ---
+    if st.session_state['tables']:
+        st.markdown("### 📝 SQL Query")
 
-                    with st.spinner("Loading into Spark..."):
-                        spark = get_spark_session(
-                            st.session_state['credentials'])
-                        if file_format == "parquet":
-                            df = spark.read.parquet(*files)
-                        else:
-                            reader = spark.read.format("csv")
-                            for k, v in csv_options.items():
-                                reader = reader.option(k, v)
-                            df = reader.load(*files)
+        # If a query was staged by the AI, use it, otherwise use session state
+        if st.session_state.get('staged_query'):
+            query_text = st.session_state.get('staged_query')
+            st.session_state['staged_query'] = None  # Clear after use
+        else:
+            query_text = st.session_state.get('sql_query', 'SELECT * FROM ... LIMIT 100')
 
-                        df.cache()
-                        df.createOrReplaceTempView(table_name)
 
-                        st.session_state['tables'][table_name] = {
-                            'dataframe': df,
-                            'temp_dir': temp_dir,
-                            'file_count': len(files),
-                            'row_count': df.count(),
-                            'col_count': len(df.columns),
-                            'source': f'Local: {len(files)} file(s)',
-                            'size_bytes': total_size,
-                            'columns': df.columns,
-                            'schema': [{'name': f.name, 'type': str(f.dataType)} for f in df.schema.fields],
-                            'created_at': datetime.now().isoformat(),
-                            's3_path': '',
-                            'file_format': file_format,
-                            'csv_options': csv_options,
-                            'loaded': True,
-                            'local_files': files,
-                            'local_path': temp_dir
-                        }
+        query = st.text_area("Enter your SQL query here:",
+                             value=query_text, height=150)
+        st.session_state['sql_query'] = query # Save user input
 
-                        save_metadata()
-                        st.session_state['metadata_cache'] = load_metadata()
-                        st.success(f"✅ Loaded {table_name}!")
-                        st.dataframe(df.limit(10).toPandas(),
-                                     use_container_width=True)
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+        col1, col2, col3 = st.columns([1, 1, 4])
+        with col1:
+            if st.button("▶️ Run Query", use_container_width=True):
+                if query.strip():
+                    with st.spinner("Executing query..."):
+                        try:
+                            spark = get_spark_session(
+                                st.session_state['credentials'])
+                            start_time = time.time()
+                            result_df = spark.sql(query)
+                            st.session_state['last_query_result_df'] = result_df
+                            st.session_state['last_query_time'] = time.time() - start_time
+                            st.session_state['last_query_error'] = None
+                            st.rerun() # Rerun to display results
+                        except Exception as e:
+                            st.session_state['last_query_result_df'] = None
+                            st.session_state['last_query_error'] = str(e)
+                            st.rerun()
+                else:
+                    st.warning("Query is empty.")
+        
+        with col2:
+             if 'last_query_result_df' in st.session_state and st.session_state['last_query_result_df'] is not None:
+                df_to_download = st.session_state['last_query_result_df']
+                csv_data = dataframe_to_csv_string(df_to_download)
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv_data,
+                    file_name=f"query_result_{int(time.time())}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+
+        if 'last_query_error' in st.session_state and st.session_state['last_query_error']:
+            st.error(f"Query Error: {st.session_state['last_query_error']}")
+
+        if 'last_query_result_df' in st.session_state and st.session_state['last_query_result_df'] is not None:
+            result_df = st.session_state['last_query_result_df']
+            query_time = st.session_state['last_query_time']
+            st.success(
+                f"Query executed in {query_time:.2f} seconds. Displaying top 500 rows.")
+
+            # Use st.dataframe for better display
+            st.dataframe(result_df.limit(500).toPandas(), height=400)
+
+            with st.expander("Result Schema"):
+                st.json([{'name': f.name, 'type': str(f.dataType)} for f in result_df.schema.fields])
+
+
+    # --- AI DATA ANALYSIS SECTION ---
+    if st.session_state['openai_key'] and st.session_state['tables']:
+        st.markdown(f"### {ui_cfg.get('ai_section_title')}")
+
+        with st.container():
+            table_to_analyze = st.selectbox(
+                "Select a table to analyze:", list(st.session_state['tables'].keys()))
+            user_question = st.text_input(
+                "Ask a question about the data:", placeholder="e.g., What's the average value of 'column_x'?")
+
+            if st.button("🧠 Analyze with AI"):
+                if table_to_analyze and user_question:
+                    with st.spinner("AI is thinking..."):
+                        response_placeholder = st.empty()
+                        full_response = ""
+                        try:
+                            stream = analyze_data_with_ai(table_to_analyze, user_question,
+                                                          st.session_state['credentials'], st.session_state['openai_key'], stream=True)
+                            for chunk in stream:
+                                if "error" in chunk:
+                                    st.error(f"AI Error: {chunk['error']}")
+                                    break
+                                content = chunk.choices[0].delta.content or ""
+                                full_response += content
+                                response_placeholder.markdown(
+                                    full_response + "▌")
+                            response_placeholder.markdown(full_response)
+
+                            # Save conversation
+                            st.session_state['ai_conversation'].insert(0, {
+                                'type': 'question',
+                                'table': table_to_analyze,
+                                'question': user_question,
+                                'response': full_response
+                            })
+
+                            # Check for SQL in response and offer to run it
+                            sql_match = re.search(
+                                r"```sql\n(.*?)```", full_response, re.DOTALL)
+                            if sql_match:
+                                sql_query = sql_match.group(1).strip()
+                                if st.button("▶️ Run Extracted SQL Query"):
+                                    st.session_state['staged_query'] = sql_query
+                                    st.rerun()
+
+                        except Exception as e:
+                            st.error(f"An unexpected error occurred: {e}")
+                else:
+                    st.warning("Please select a table and ask a question.")
+
+        # Display conversation history
+        if st.session_state['ai_conversation']:
+            st.markdown("---")
+            st.markdown("#### History")
+            for i, entry in enumerate(st.session_state['ai_conversation']):
+                _display_conversation_entry(len(st.session_state['ai_conversation']) - i, entry)
+
+
+
 
 if __name__ == "__main__":
     main()
